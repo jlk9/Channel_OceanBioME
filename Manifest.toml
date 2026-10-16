@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "d2a3a0720e0a3e1b89a04d16575d2b3f9202ca13"
+project_hash = "194d21d534d73b90d31ae219d820a27e678f19bb"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -370,6 +370,18 @@ git-tree-sha1 = "ac858e66e7bee15ccc5931967260db8fe051e2a6"
 uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
 version = "3.3.3"
 
+[[deps.GibbsSeaWater]]
+deps = ["GibbsSeaWater_jll", "Libdl", "Test"]
+git-tree-sha1 = "f4318e7a751703a5db8b57c112e5cd5c218d296b"
+uuid = "9a22fb26-0b63-4589-b28e-8f9d0b5c3d05"
+version = "0.1.4"
+
+[[deps.GibbsSeaWater_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
+git-tree-sha1 = "c91ca76546871efaa1aefdd2b19cc41c3ead2160"
+uuid = "6727f6b2-98ea-5d0a-8239-2f72283ddb11"
+version = "3.5.2+0"
+
 [[deps.Glob]]
 git-tree-sha1 = "246c628cec062230b7d183aab88841fa94fcabe9"
 uuid = "c27321d9-0574-5035-807b-f59d2c89b15c"
@@ -663,6 +675,12 @@ deps = ["Reexport", "StructIO"]
 git-tree-sha1 = "23c4d109603f7a7bfe888c1f63c5ab7be6183d0b"
 uuid = "d8793406-e978-5875-9003-1fc021f44a92"
 version = "0.5.1"
+
+[[deps.OceanBioME]]
+deps = ["Adapt", "Atomix", "GibbsSeaWater", "JLD2", "KernelAbstractions", "Oceananigans", "OffsetArrays", "SeawaterPolynomials"]
+git-tree-sha1 = "5021792c66d330bb1c861ca0b3792e89824b13f9"
+uuid = "a49af516-9db8-4be4-be45-1dad61c5a376"
+version = "0.20.1"
 
 [[deps.Oceananigans]]
 deps = ["Adapt", "BFloat16s", "Crayons", "CubedSphere", "Dates", "Distances", "DocStringExtensions", "FFTW", "GPUArraysCore", "Glob", "InteractiveUtils", "JLD2", "KernelAbstractions", "Krylov", "LinearAlgebra", "Logging", "MPI", "MuladdMacro", "OffsetArrays", "OrderedCollections", "Printf", "ReactantCore", "Rotations", "SeawaterPolynomials", "SparseArrays", "StaticArrays", "Statistics", "StructArrays"]
@@ -1106,6 +1124,11 @@ version = "0.20.10"
     JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
     RecursiveArrayTools = "731186ca-8d62-57ce-b412-fbd966d074cd"
     StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[[deps.Test]]
+deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
+uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+version = "1.11.0"
 
 [[deps.Tracy]]
 deps = ["ExprTools", "LibTracyClient_jll", "Libdl"]
