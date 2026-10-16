@@ -39,6 +39,6 @@ fd_seed = 2026                   # seeds every FD direction
 fd_random_directions = 2         # directions over all inputs at once
 # One direction per input listed (the log lists the model's inputs; biogeochemical
 # tracers appear under their names):
-fd_components = ["T", "S", "u", "v", "ssh", "U", "V",
+fd_components = ["T", "S", "u", "v",
                  "u_wind_stress", "v_wind_stress", "temp_flux",
                  "kappa_z"]
