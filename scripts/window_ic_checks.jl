@@ -84,13 +84,17 @@ if !@isdefined(_WINDOW_IC_CHECKS_LOADED)
     # Configs saved by older versions of this code, normalized so those runs can
     # still serve as a window IC source: before the `kind` key was dropped they
     # carry kind = "truth" (ignored); before [model] architecture existed every
-    # run was on Reactant.
+    # run was on Reactant; before [model] biogeochemistry existed none had any.
     function saved_sections(d, w)
         d = copy(d)
         get(d, "kind", nothing) == "truth" && delete!(d, "kind")
         model = get(d, "model", nothing)
-        model isa AbstractDict && !haskey(model, "architecture") &&
-            (d["model"] = merge(model, Dict("architecture" => "reactant")))
+        if model isa AbstractDict
+            model = copy(model)
+            haskey(model, "architecture")    || (model["architecture"] = "reactant")
+            haskey(model, "biogeochemistry") || (model["biogeochemistry"] = "none")
+            d["model"] = model
+        end
         t = parse_config(d, w)
         return (; t.model, run = (; t.run.Nspinup, t.run.Ntimesteps), t.kappa, t.spice)
     end

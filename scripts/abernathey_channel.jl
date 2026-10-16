@@ -188,17 +188,18 @@ architecture = use_reactant ? ReactantState() : CPU()
 # Make the grid:
 grid = make_grid(architecture, Nx, Ny, Nz, z_faces)
 
-# BIOGEOCHEMISTRY: `nothing`, or an Oceananigans AbstractBiogeochemistry built on
-# `grid` (e.g. an OceanBioME model). Its tracers are added to the model, carried
-# in ModelState, restored at every window, saved (<name>_init, <name>_final,
-# d<name>), seen by J (J_tracers) and perturbed by the FD check, with no further
-# edit. Their initial values: set! them on the model right after build_model
-# (they are copied into the analytic initial state below); otherwise they start
-# at zero. Its parameters are plain numbers baked into the compiled graph, so
-# they get no gradient (ad_checks.jl).
-biogeochemistry = nothing
+# BIOGEOCHEMISTRY ([model] biogeochemistry; build_biogeochemistry in
+# channel_common.jl): `nothing`, or an Oceananigans AbstractBiogeochemistry built
+# on `grid`. Its tracers are added to the model, carried in ModelState, restored
+# at every window, saved (<name>_init, <name>_final, d<name>), seen by J
+# (J_tracers) and perturbed by the FD check, with no further edit. Their initial
+# values are set on the model right after build_model and copied into the
+# analytic initial state below. Its parameters are plain numbers baked into the
+# compiled graph, so they get no gradient (ad_checks.jl).
+biogeochemistry = build_biogeochemistry(grid)
 
 model         = build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = use_gmredi, biogeochemistry)
+set_biogeochemical_initial_conditions!(model)
 T_flux        = T_flux_init(model.grid, parameters)
 u_wind_stress = u_wind_stress_init(model.grid, parameters)
 v_wind_stress = v_wind_stress_init(model.grid, parameters)

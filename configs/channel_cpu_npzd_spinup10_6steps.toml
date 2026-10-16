@@ -1,0 +1,44 @@
+# Run config: run with
+#   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
+#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_gmredi_spinup10_6steps.toml
+# Output: runs/channel_gmredi_spinup10_6steps/. Every key is required;
+# see scripts/run_config.jl for the rules. Values are SI.
+#
+# The channel with constant-κ GM/Redi and scalar vertical mixing, spice
+# off, spun up for a month; then a 1-day window, its AD gradient, the
+# determinism probe and the FD check of every input (ad_checks.jl).
+
+[model]
+architecture = "cpu"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+Nx = 40
+Ny = 80
+dt = 600.0                       # s
+advection = "centered"           # "centered" (smooth; needed for the FD check) or "weno"
+vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
+fill_kappa_halos = false          # false only to reproduce runs made before the κ halo fix
+gmredi = false                    # false: no GM/Redi (then no [kappa])
+biogeochemistry = "npzd"         # "none" or "npzd" (OceanBioME NPZD; build_biogeochemistry)
+
+[run]
+Nspinup = 10                   # 1 month
+Ntimesteps = 6                 # 1 day: the estimate window (the AD'd part)
+spunup_state = ""                # "" = spin up here; else a saved data_init/data_final.jld2
+
+[spice]                          # density-compensated salinity anomaly (spice_anomaly)
+S0 = 35.0                        # psu, reference salinity
+dS = 0.0                         # psu, amplitude; 0 = off
+y = 800e3                        # m, centre (meridional)
+L = 250e3                        # m, Gaussian width (meridional)
+z = -800.0                       # m, centre (vertical)
+H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
+
+[checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
+determinism_probe = true         # J bitwise reproducible after an AD call at other inputs (~1 AD + 2 forward calls)
+fd_check = true                  # FD vs AD directional derivatives (2 forward windows per ε per direction)
+fd_seed = 2026                   # seeds every FD direction
+fd_random_directions = 2         # directions over all inputs at once
+# One direction per input listed (the log lists the model's inputs; biogeochemical
+# tracers appear under their names):
+fd_components = ["T", "S", "u", "v", "ssh", "U", "V",
+                 "u_wind_stress", "v_wind_stress", "temp_flux",
+                 "kappa_z"]

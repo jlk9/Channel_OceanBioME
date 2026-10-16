@@ -9,7 +9,7 @@
 # determinism probe and the FD check of every input (ad_checks.jl).
 
 [model]
-architecture = "cpu"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
 Nx = 40
 Ny = 80
 dt = 600.0                       # s
@@ -17,6 +17,7 @@ advection = "centered"           # "centered" (smooth; needed for the FD check) 
 vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
 fill_kappa_halos = false          # false only to reproduce runs made before the κ halo fix
 gmredi = false                    # false: no GM/Redi (then no [kappa])
+biogeochemistry = "none"         # "none" or "npzd" (OceanBioME NPZD; build_biogeochemistry)
 
 [run]
 Nspinup = 10                   # 1 month

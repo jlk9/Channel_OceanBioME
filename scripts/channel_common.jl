@@ -45,6 +45,9 @@ using Oceananigans.BoundaryConditions: fill_halo_regions!
 
 using SeawaterPolynomials
 
+# Imported, not `using`: its many exports would share the driver's namespace.
+import OceanBioME
+
 # Dependency for Reactant + KernelAbstractions, even on CPU-only machines:
 using CUDA
 
@@ -88,6 +91,11 @@ include(joinpath(@__DIR__, "channel_geometry.jl"))
 # (restore_clock!), and in the driver's compile block.
 const use_reactant = RUN_CONFIG.model.architecture == "reactant"
 use_reactant && @info "To specify the Reactant backend uncomment line 'Reactant.set_default_backend(\"cpu\")' in channel_common.jl"
+
+# The biogeochemistry ([model] biogeochemistry): "none" or "npzd". Built by
+# build_biogeochemistry, its initial conditions set by
+# set_biogeochemical_initial_conditions! (see "Biogeochemistry" below).
+const biogeochemistry_choice = RUN_CONFIG.model.biogeochemistry
 
 # Salinity and the density-compensated spice anomaly S′(y, z) ([spice]): see
 # spice_anomaly for the design. They enter `parameters` below (saved as
@@ -293,9 +301,9 @@ end
 #####
 
 # `biogeochemistry`: an Oceananigans AbstractBiogeochemistry (e.g. an OceanBioME
-# model built on `grid`), or `nothing`. Oceananigans adds its required tracers to
-# (:T, :S) itself, and ModelState, the restore and the save files carry every
-# tracer of the model, so they need no edit for it. Its boundary conditions
+# model built on `grid`), or `nothing`. Its required tracers are declared after
+# (:T, :S) (model_tracer_names), and ModelState, the restore and the save files
+# carry every tracer of the model, so they need no edit for it. Its boundary conditions
 # and forcing come with it. What ModelState does NOT carry is any other state
 # it keeps from step to step (e.g. sediment fields): see
 # report_biogeochemical_state.
@@ -424,9 +432,9 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
         coriolis = coriolis,
         closure = closure,
         # CATKE adds its TKE tracer `e` itself (declaring it as well is an error);
-        # without CATKE nothing uses an `e`, so none is carried. Likewise the
-        # biogeochemistry adds its required tracers.
-        tracers = (:T, :S),
+        # without CATKE nothing uses an `e`, so none is carried. The
+        # biogeochemistry's tracers are declared here (model_tracer_names).
+        tracers = model_tracer_names(biogeochemistry),
         biogeochemistry = biogeochemistry,
         boundary_conditions = (T = T_bcs, u = u_bcs, v = v_bcs),
         forcing = forcing
@@ -436,6 +444,55 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
 
     return model
 end
+
+#####
+##### Biogeochemistry ([model] biogeochemistry)
+#####
+
+# The tracers to declare: (:T, :S), then the biogeochemistry's other required
+# tracers in its order. They must be declared: a biogeochemistry that requires
+# one of ours (NPZD's growth reads T) refuses a model that declares only some
+# of its tracers, rather than adding the rest itself.
+model_tracer_names(::Nothing) = (:T, :S)
+model_tracer_names(bgc) =
+    (:T, :S, filter(n -> !(n in (:T, :S)),
+                    Oceananigans.Biogeochemistry.required_biogeochemical_tracers(bgc))...)
+
+# The biogeochemistry for `grid`, or `nothing`. "npzd": OceanBioME's NPZD with
+# all its defaults (Kuhn et al. 2015 parameters; two-band light under a constant
+# surface PAR of 100 W/m², so no clock dependence; detritus sinking out of an
+# open bottom; no sediment, no negative-tracer modifiers). Its parameters are
+# plain numbers, baked into a compiled graph: no gradient, no FD perturbation.
+build_biogeochemistry(grid) =
+    biogeochemistry_choice == "npzd" ? OceanBioME.NPZD(grid) : nothing
+
+# NPZD initial conditions [mmol N/m³], functions of depth only, smooth and
+# STRICTLY POSITIVE: the two-band light model raises chlorophyll (from P) to a
+# fractional power, which has no real derivative at P = 0 and is NaN below.
+# Nutrient-poor surface over a nutrient-rich interior; plankton and detritus
+# surface-intensified over small positive backgrounds. Saved and checked as a
+# code constant (biogeochemistry_initial_conditions).
+const npzd_initial_conditions = (; N_surface = 2.0,  N_deep = 15.0, h_N = 300.0,   # nutrients; h in m
+                                   P_background = 0.01, P_surface = 0.5, h_P = 50.0,  # phytoplankton
+                                   Z_background = 0.01, Z_surface = 0.2, h_Z = 50.0,  # zooplankton
+                                   D_background = 0.01, D_surface = 0.1, h_D = 200.0) # detritus
+
+# Set the biogeochemical tracers' initial values on `model`, right after
+# build_model (the driver then copies them into the analytic initial state).
+set_biogeochemical_initial_conditions!(model) = set_biogeochemical_initial_conditions!(model, Val(Symbol(biogeochemistry_choice)))
+set_biogeochemical_initial_conditions!(model, ::Val{:none}) = nothing
+
+function set_biogeochemical_initial_conditions!(model, ::Val{:npzd})
+    c = npzd_initial_conditions
+    Nᵢ(x, y, z) = c.N_deep + (c.N_surface - c.N_deep) * exp(z / c.h_N)
+    Pᵢ(x, y, z) = c.P_background + c.P_surface * exp(z / c.h_P)
+    Zᵢ(x, y, z) = c.Z_background + c.Z_surface * exp(z / c.h_Z)
+    Dᵢ(x, y, z) = c.D_background + c.D_surface * exp(z / c.h_D)
+    @allowscalar set!(model, N = Nᵢ, P = Pᵢ, Z = Zᵢ, D = Dᵢ)
+    return nothing
+end
+
+biogeochemistry_initial_conditions() = biogeochemistry_choice == "npzd" ? sprint(show, npzd_initial_conditions) : ""
 
 #####
 ##### Closure accessors: find a closure by TYPE, not by tuple position
@@ -1331,6 +1388,7 @@ code_constants() = (; coriolis_f              = f,
                       decay_scale,
                       free_surface_substeps,
                       vertical_mixing_details = vertical_mixing_details(),   # CATKE's parameters ("" without)
+                      biogeochemistry_initial_conditions = biogeochemistry_initial_conditions(),  # "" without
                       forcing_parameters      = parameters)
 
 # Metadata common to init and final files: the code-level constants, a few

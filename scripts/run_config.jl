@@ -81,8 +81,11 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     # x-face Nx/2 + 1. architecture: "reactant" compiles the runs (XLA) and
     # differentiates through the compiled graph; "cpu" runs plain Julia on
     # Oceananigans' CPU architecture and differentiates with Enzyme directly.
+    # biogeochemistry: "none", or "npzd" (OceanBioME's NPZD with its defaults,
+    # built by build_biogeochemistry in channel_common.jl).
     function parse_model_config(d, w)
-        keys_ = ("architecture", "Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi")
+        keys_ = ("architecture", "Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi",
+                 "biogeochemistry")
         only_config_keys(d, keys_, w)
         return (; architecture = config_choice(d, "architecture", ("reactant", "cpu"), w),
                   Nx = config_value(d, "Nx", Int, w; check = n -> n ≥ 2 && iseven(n), why = "must be an even integer ≥ 2"),
@@ -91,7 +94,8 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   advection = config_choice(d, "advection", ("centered", "weno"), w),
                   vertical_mixing = config_choice(d, "vertical_mixing", ("catke", "scalar_surface_taper"), w),
                   fill_kappa_halos = config_value(d, "fill_kappa_halos", Bool, w),
-                  gmredi = config_value(d, "gmredi", Bool, w))
+                  gmredi = config_value(d, "gmredi", Bool, w),
+                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd"), w))
     end
 
     # [run]: step counts, and where the spinup comes from (spunup_state = ""
