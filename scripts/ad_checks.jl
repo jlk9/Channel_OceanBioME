@@ -123,6 +123,90 @@ if !@isdefined(_AD_CHECKS_LOADED)
         return m
     end
 
+    #####
+    ##### NaN derivatives on dry entries
+    #####
+    # DISCLAIMER: on the CPU architecture, Enzyme returns NaN derivatives on DRY
+    # (immersed) entries of the velocity shadows: du, dv, dU, dV in the wall
+    # (2026-10-16, 10-step spinup / 6-step window: every dry u-face and the dry
+    # interior v-faces; wet entries finite and equal to Reactant's to ~1e-16).
+    # Reactant gives finite but NONZERO, equally meaningless values there (dU up
+    # to 1.3e-2 in the wall, as large as anywhere wet), which are left as they
+    # are: read dry entries of Reactant shadows as junk too. The likely source is a 0·∞ in the
+    # reverse pass of an Oceananigans kernel that divides by a zero water-column
+    # depth and hides the result with ifelse, which set_strong_zero does not
+    # catch on the CPU path (not confirmed). A velocity in a wall is held at
+    # zero, so its derivative carries no information; but a NaN poisons every
+    # sum it enters (the FD check's directional derivatives, plots), so
+    # zero_dry_nans! sets those entries to 0 right after the run's AD call.
+    # Saved dry-entry derivatives are therefore 0 by construction, not computed.
+    # A NaN on a WET entry is never zeroed: it is an error.
+
+    # Zero the NaNs of one shadow `a` (host-side) on the dry entries of `wet`;
+    # error on a wet NaN. `write!(h)` writes the cleaned host copy back. Returns
+    # the number of entries zeroed.
+    function zero_dry_nans_of!(name, h, wet, write!)
+        nans = isnan.(h)
+        any(nans) || return 0
+        n_wet = count(nans .& wet)
+        n_wet == 0 || error("AD: ∂J/∂$name has $n_wet NaN entries on WET points: a broken gradient, not a dry-cell artifact")
+        h[nans] .= 0
+        write!(h)
+        return count(nans)
+    end
+
+    """
+        zero_dry_nans!(model, dmodel, dinputs, dstate) -> String
+
+    Set to 0 every NaN of the run's shadows that lies on a dry (immersed) entry,
+    erroring on any NaN on a wet entry (see the DISCLAIMER above). Covers every
+    shadow that is saved or read by the FD check: the ModelState shadow (every
+    tracer, u, v, w, η, U, V), the forcing shadows, and the κz / GM/Redi κ
+    shadows. Host-side, between compiled calls; a shadow without NaNs is not
+    written. Returns a report ("" if nothing was zeroed), also logged.
+    """
+    function zero_dry_nans!(model, dmodel, dinputs, dstate)
+        masks = fd_wet_masks(model)
+        # z-faces of w: wet between two wet cells, and at the top of a wet
+        # column; the bottom face (k = 1) and faces on the immersed bottom are dry.
+        c = masks.c
+        w_wet = falses(size(c, 1), size(c, 2), Nz + 1)
+        w_wet[:, :, 2:Nz] .= c[:, :, 1:Nz-1] .& c[:, :, 2:Nz]
+        w_wet[:, :, Nz+1] .= c[:, :, Nz]
+
+        zeroed = Pair{String, Int}[]
+        record!(name, n) = n > 0 && push!(zeroed, name => n)
+
+        # ModelState shadow leaves (bare arrays), with the model field that gives
+        # each one's location.
+        fs = model.free_surface
+        leaves = [[(String(n), dstate.tracers[n], fd_mask(masks, model.tracers[n])) for n in keys(dstate.tracers)];
+                  [("u",   dstate.u, fd_mask(masks, model.velocities.u)),
+                   ("v",   dstate.v, fd_mask(masks, model.velocities.v)),
+                   ("w",   dstate.w, w_wet),
+                   ("ssh", dstate.η, fd_mask(masks, fs.displacement)),
+                   ("U",   dstate.U, fd_mask(masks, fs.barotropic_velocities.U)),
+                   ("V",   dstate.V, fd_mask(masks, fs.barotropic_velocities.V))]]
+        for (name, da, wet) in leaves
+            record!(name, zero_dry_nans_of!(name, Array(da), wet, h -> copyto!(da, h)))
+        end
+
+        # Field shadows: the forcing, κz (one Field shared by every tracer), GM/Redi κ.
+        fields = Tuple{String, Any}[(String(k), getfield(dinputs, k)) for k in (:u_wind_stress, :v_wind_stress, :temp_flux)]
+        vsc = vertical_scalar_closure(dmodel)
+        vsc !== nothing && vsc.κ.T isa Field && push!(fields, ("kappa_z", vsc.κ.T))
+        dissd = find_closure(dmodel, IsopycnalSkewSymmetricDiffusivity)
+        dissd !== nothing && push!(fields, ("kappa_skew", dissd.κ_skew), ("kappa_symmetric", dissd.κ_symmetric))
+        for (name, df) in fields
+            record!(name, zero_dry_nans_of!(name, to_host(df), fd_mask(masks, df), h -> write_interior_host!(df, h)))
+        end
+
+        isempty(zeroed) && return ""
+        report = "zeroed NaN derivatives on dry entries: " * join(["d$k $n" for (k, n) in zeroed], ", ")
+        @warn "AD: $report (see the DISCLAIMER in ad_checks.jl; wet entries have no NaN)"
+        return report
+    end
+
     # Write `a` (interior-sized host array) into a Field's interior, host-side
     # between compiled calls. Through a host copy of the parent, because the
     # parent is a device array that takes whole host arrays (copyto!), while an

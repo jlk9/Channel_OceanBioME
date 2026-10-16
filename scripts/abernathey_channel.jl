@@ -346,6 +346,12 @@ dedν = rdifferentiate_tracer_error(model, model_inputs, spunup_state,
 
 @show dedν
 
+# NaN derivatives on dry (immersed) entries — CPU Enzyme gives them in the
+# velocity shadows' wall entries — are set to 0 here, before anything saves or
+# reads the shadows; a NaN on a wet entry is an error. See the DISCLAIMER in
+# ad_checks.jl. The report is saved as dry_nans_zeroed ("" = none).
+dry_nan_report = zero_dry_nans!(model, dmodel, dmodel_inputs, dspunup_state)
+
 # The forward and reverse functions are separately compiled graphs, so their J
 # agree to round-off, not bitwise.
 J_probe === nothing ||
@@ -357,7 +363,8 @@ J_probe === nothing ||
 # dkappa_* are ∂J/∂κ accumulated over the window.
 filename = graph_directory * "data_final.jld2"
 save_final!(filename, model, dmodel, dmodel_inputs, dspunup_state, dedν;
-            extra = use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata)
+            extra = merge(use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata,
+                          (; dry_nans_zeroed = dry_nan_report)))
 
 # FD CHECK of the gradient just saved (ad_checks.jl). After save_final!: its
 # evaluations move the model, never the saved files' content.
