@@ -9,7 +9,7 @@
 # determinism probe and the FD check of every input (ad_checks.jl).
 
 [model]
-architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+architecture = "cpu"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
 Nx = 40
 Ny = 80
 dt = 600.0                       # s

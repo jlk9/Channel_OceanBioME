@@ -56,6 +56,8 @@ using ReactantCore: Binomial
 
 using Enzyme
 
+Enzyme.API.strictAliasing!(false)
+
 using FileIO, JLD2
 
 import Pkg   # stdlib; only for the package versions in the save provenance
@@ -1014,9 +1016,22 @@ end
 # see set_model_state! for why a fresh assignment is not enough.
 set_traced!(x, value) = (x.mlir_data = value.mlir_data; nothing)
 
-# Restore the clock for a run: the time from the state's 0-d array, the
-# iteration from 0. Under Reactant IN PLACE (see set_model_state!); on the CPU
-# the clock holds plain numbers and is simply reassigned.
+# Restore the clock for a run: the time from the state's 0-d array, and the
+# iteration. Under Reactant IN PLACE (see set_model_state!); on the CPU the
+# clock holds plain numbers and is simply reassigned.
+#
+# THE CPU ITERATION IS 1, NOT 0, DELIBERATELY. On the CPU, Oceananigans'
+# time_step! runs maybe_prepare_first_time_step! when clock.iteration == 0, and
+# its reconcile_state! recomputes the barotropic U, V from u, v
+# (compute_barotropic_mode!), overwriting the U, V just restored from
+# ModelState. J would then not depend on the restored U, V (∂J/∂U = ∂J/∂V = 0)
+# and would be a different function from the Reactant one, whose time_step!
+# override never calls it. Starting at 1 skips it, so both architectures run
+# the same steps from the same restored state. Safe because start_run! already
+# does what it is for (update_state! after the restore), build_model sets
+# clock.last_Δt, and the first step is forward-Euler by `euler = true`. The
+# iteration is a step counter nothing else reads. Re-check after Oceananigans
+# upgrades (0.114.0: TimeSteppers.jl, maybe_prepare_first_time_step!).
 function restore_clock!(::ReactantState, clock, time)
     set_traced!(clock.time, time[])
     set_traced!(clock.iteration, zero(clock.iteration))
@@ -1025,7 +1040,7 @@ end
 
 function restore_clock!(::CPU, clock, time)
     clock.time = time[]
-    clock.iteration = 0
+    clock.iteration = 1
     return nothing
 end
 
@@ -1033,8 +1048,9 @@ function set_model_state!(model, state)
     # The clock first, so the halo fill below (which passes the clock to the
     # boundary conditions) and the κ policy's start hook see the restored time.
     # The time is the state's (continuous from the spinup into the window); the
-    # iteration restarts, since it counts the steps of this run. Neither is read
-    # by the current configuration. The clock is not itself part of ModelState.
+    # iteration restarts, since it counts the steps of this run (from 0 under
+    # Reactant, from 1 on the CPU: see restore_clock!). Neither is read by the
+    # current configuration. The clock is not itself part of ModelState.
     #
     # Under Reactant the clock holds Reactant numbers, restored IN PLACE
     # (restore_clock!, via set_traced!), as Oceananigans' Reactant tick! updates it.

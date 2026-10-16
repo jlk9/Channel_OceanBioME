@@ -137,9 +137,12 @@ if !@isdefined(_AD_CHECKS_LOADED)
         return nothing
     end
 
-    # A ModelState leaf (bare device array) and its shadow.
+    # A ModelState leaf (bare device array) and its shadow. Read with Array(·),
+    # which always copies: on the CPU the leaf is already an Array, and
+    # convert(Array, ·) would return the live array itself, so the saved p₀
+    # would change with every perturbation and restore! would restore nothing.
     state_component(name, a, da, mask) =
-        FDComponent(name, () -> convert(Array, a), h -> (copyto!(a, h); nothing), () -> convert(Array, da), mask)
+        FDComponent(name, () -> Array(a), h -> (copyto!(a, h); nothing), () -> Array(da), mask)
 
     # A Field and its shadow Field.
     field_component(name, f, df, mask) =
