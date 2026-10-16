@@ -81,10 +81,16 @@ if !@isdefined(_WINDOW_IC_CHECKS_LOADED)
     # (saved_sections).
     run_sections(cfg) = (; cfg.model, run = (; cfg.run.Nspinup, cfg.run.Ntimesteps), cfg.kappa, cfg.spice)
 
-    # Configs saved before the `kind` key was dropped carry kind = "truth";
-    # ignore it so those runs can still serve as a window IC source.
+    # Configs saved by older versions of this code, normalized so those runs can
+    # still serve as a window IC source: before the `kind` key was dropped they
+    # carry kind = "truth" (ignored); before [model] architecture existed every
+    # run was on Reactant.
     function saved_sections(d, w)
-        get(d, "kind", nothing) == "truth" && (d = delete!(copy(d), "kind"))
+        d = copy(d)
+        get(d, "kind", nothing) == "truth" && delete!(d, "kind")
+        model = get(d, "model", nothing)
+        model isa AbstractDict && !haskey(model, "architecture") &&
+            (d["model"] = merge(model, Dict("architecture" => "reactant")))
         t = parse_config(d, w)
         return (; t.model, run = (; t.run.Nspinup, t.run.Ntimesteps), t.kappa, t.spice)
     end

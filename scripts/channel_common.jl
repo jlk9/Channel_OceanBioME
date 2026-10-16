@@ -45,10 +45,11 @@ using Oceananigans.BoundaryConditions: fill_halo_regions!
 
 using SeawaterPolynomials
 
+# Dependency for Reactant + KernelAbstractions, even on CPU-only machines:
 using CUDA
 
 using Reactant
-using Oceananigans.Architectures: ReactantState
+using Oceananigans.Architectures: ReactantState, on_architecture
 #Reactant.set_default_backend("cpu")
 
 using ReactantCore: Binomial
@@ -61,7 +62,6 @@ import Pkg   # stdlib; only for the package versions in the save provenance
 
 Oceananigans.defaults.FloatType = Float64
 
-@info "To specify architecture uncomment line 'Reactant.set_default_backend(\"cpu\")' "
 #Reactant.set_default_backend("cpu")
 
 # Dependency-free channel geometry, shared with the host-side tools (plotting):
@@ -77,6 +77,15 @@ include(joinpath(@__DIR__, "channel_geometry.jl"))
 #####
 # The driver parses its config into `RUN_CONFIG` before including this file.
 # Change these in the config file, never here.
+
+# The architecture ([model] architecture): Reactant (runs compiled with
+# @compile, the window Binomial-checkpointed) or plain CPU (the same functions
+# called directly; @trace loops run as ordinary Julia loops, so the window is
+# NOT checkpointed and Enzyme tapes every step). The code paths differ only
+# where an array is allocated (on_architecture) and the clock is restored
+# (restore_clock!), and in the driver's compile block.
+const use_reactant = RUN_CONFIG.model.architecture == "reactant"
+use_reactant && @info "To specify the Reactant backend uncomment line 'Reactant.set_default_backend(\"cpu\")' in channel_common.jl"
 
 # Salinity and the density-compensated spice anomaly S′(y, z) ([spice]): see
 # spice_anomaly for the design. They enter `parameters` below (saved as
@@ -772,8 +781,9 @@ end
 # start time of a run from the analytic initial condition.
 function allocate_model_state(model)
     FT = Oceananigans.defaults.FloatType
-    zeroed(field) = Reactant.to_rarray(zeros(FT, size(interior(field))...))
-    zeroed_parent(field) = Reactant.to_rarray(zeros(FT, size(parent(field))...))
+    arch = Oceananigans.Architectures.architecture(model.grid)
+    zeroed(field) = on_architecture(arch, zeros(FT, size(interior(field))...))
+    zeroed_parent(field) = on_architecture(arch, zeros(FT, size(parent(field))...))
 
     cfields = model_closure_state_fields(model)
     closure = cfields === nothing ? nothing : map(nt -> map(zeroed_parent, nt), cfields)
@@ -786,7 +796,7 @@ function allocate_model_state(model)
                       zeroed(model.free_surface.barotropic_velocities.U),
                       zeroed(model.free_surface.barotropic_velocities.V),
                       closure,
-                      Reactant.to_rarray(fill(zero(Float64))))
+                      on_architecture(arch, fill(zero(Float64))))
 end
 
 # Copy `model`'s current prognostic state into `state`, in place. Called
@@ -1004,15 +1014,30 @@ end
 # see set_model_state! for why a fresh assignment is not enough.
 set_traced!(x, value) = (x.mlir_data = value.mlir_data; nothing)
 
+# Restore the clock for a run: the time from the state's 0-d array, the
+# iteration from 0. Under Reactant IN PLACE (see set_model_state!); on the CPU
+# the clock holds plain numbers and is simply reassigned.
+function restore_clock!(::ReactantState, clock, time)
+    set_traced!(clock.time, time[])
+    set_traced!(clock.iteration, zero(clock.iteration))
+    return nothing
+end
+
+function restore_clock!(::CPU, clock, time)
+    clock.time = time[]
+    clock.iteration = 0
+    return nothing
+end
+
 function set_model_state!(model, state)
     # The clock first, so the halo fill below (which passes the clock to the
     # boundary conditions) and the κ policy's start hook see the restored time.
     # The time is the state's (continuous from the spinup into the window); the
     # iteration restarts, since it counts the steps of this run. Neither is read
-    # by the current configuration. The clock holds Reactant numbers and is not
-    # itself part of ModelState.
+    # by the current configuration. The clock is not itself part of ModelState.
     #
-    # IN PLACE (set_traced!), as Oceananigans' Reactant tick! updates the clock.
+    # Under Reactant the clock holds Reactant numbers, restored IN PLACE
+    # (restore_clock!, via set_traced!), as Oceananigans' Reactant tick! updates it.
     # Assigning a new number (`model.clock.time = …`) computes correctly inside
     # the compiled function, but after a compiled AD call Reactant does not copy
     # the new object's value back to the host clock (after a forward call it
@@ -1021,8 +1046,7 @@ function set_model_state!(model, state)
     # after forward and AD calls alike, and the gradient flows through the
     # restored time. The Int iteration is copied back after forward calls only:
     # after an AD call the host keeps the restored 0. Nothing reads it.
-    set_traced!(model.clock.time, state.time[])
-    set_traced!(model.clock.iteration, zero(model.clock.iteration))
+    restore_clock!(Oceananigans.Architectures.architecture(model.grid), model.clock, state.time)
 
     # Every tracer, by name. A Julia loop over the (compile-time) tracer names:
     # one write per tracer, not repeated model work, so it is not an @trace loop.
@@ -1256,8 +1280,9 @@ end
 const LAUNCH_PROVENANCE = launch_provenance()
 
 # The Reactant backend the run computes on ("cpu", "cuda", …), read at save time,
-# after the compiled calls have initialized it.
-reactant_backend() = try
+# after the compiled calls have initialized it; "none" for a run that is not on
+# Reactant ([model] architecture = "cpu").
+reactant_backend() = !use_reactant ? "none" : try
     string(Reactant.XLA.platform_name(Reactant.XLA.default_backend()))
 catch
     "unknown"

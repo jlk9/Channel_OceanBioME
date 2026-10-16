@@ -179,8 +179,8 @@ end
 ##### Actually creating our model and using these functions to run it:
 #####
 
-# Architecture
-architecture = ReactantState()
+# Architecture ([model] architecture; see use_reactant in channel_common.jl)
+architecture = use_reactant ? ReactantState() : CPU()
 
 # Timestep size:
 Δt₀ = RUN_CONFIG.model.dt   # [s], [model] dt
@@ -203,7 +203,7 @@ T_flux        = T_flux_init(model.grid, parameters)
 u_wind_stress = u_wind_stress_init(model.grid, parameters)
 v_wind_stress = v_wind_stress_init(model.grid, parameters)
 Tᵢ, Sᵢ        = temperature_salinity_init(model.grid, parameters)
-Δzᶜ            = Reactant.ConcreteRArray(Δz) #zspacings(model.grid, Center()))
+Δzᶜ            = on_architecture(architecture, Δz) #zspacings(model.grid, Center()))
 
 report_biogeochemical_state(model)
 
@@ -254,15 +254,26 @@ if load_spunup_state
     @show load_toc
 end
 
-@info "Compiling the model run... (spinup, forward window, and its reverse-mode derivative)"
+# The r-prefixed functions are what the rest of the run calls: under Reactant
+# the compiled graphs, on the CPU the plain functions themselves (Julia and
+# Enzyme then compile on the first call, so that call is slow and compile_toc
+# is ~0).
 tic = time()
-# The spinup is only compiled when it will run (see spunup_state_path).
-if !load_spunup_state
-    rspinup_reentrant_channel_model! = @compile raise_first=true raise=true sync=true  spinup_reentrant_channel_model!(model, model_inputs, initial_state, Nspinup)
+if use_reactant
+    @info "Compiling the model run... (spinup, forward window, and its reverse-mode derivative)"
+    # The spinup is only compiled when it will run (see spunup_state_path).
+    if !load_spunup_state
+        rspinup_reentrant_channel_model! = @compile raise_first=true raise=true sync=true  spinup_reentrant_channel_model!(model, model_inputs, initial_state, Nspinup)
+    end
+    restimate_tracer_error = @compile raise_first=true raise=true sync=true estimate_tracer_error(model, model_inputs, spunup_state, x_midpoint, Ntimesteps)
+    rdifferentiate_tracer_error = @compile raise_first=true raise=true sync=true  differentiate_tracer_error(model, model_inputs, spunup_state,
+                                                                                                             dmodel, dmodel_inputs, dspunup_state, x_midpoint, Ntimesteps)
+else
+    @info "CPU architecture: no @compile; the functions are called directly."
+    rspinup_reentrant_channel_model! = spinup_reentrant_channel_model!
+    restimate_tracer_error           = estimate_tracer_error
+    rdifferentiate_tracer_error      = differentiate_tracer_error
 end
-restimate_tracer_error = @compile raise_first=true raise=true sync=true estimate_tracer_error(model, model_inputs, spunup_state, x_midpoint, Ntimesteps)
-rdifferentiate_tracer_error = @compile raise_first=true raise=true sync=true  differentiate_tracer_error(model, model_inputs, spunup_state,
-                                                                                                         dmodel, dmodel_inputs, dspunup_state, x_midpoint, Ntimesteps)
 compile_toc = time() - tic
 
 @show compile_toc
@@ -290,6 +301,7 @@ end
 # Δt₀ is the configured timestep; the actual value used is also saved as
 # clock_last_dt by common_save_metadata. The κ values are in common_save_metadata.
 run_metadata = (; run_type = "channel_ad",
+                  architecture = RUN_CONFIG.model.architecture,
                   Ntimesteps, Nspinup,
                   dt = Δt₀,
                   advection = use_smooth_advection ? "centered" : "weno",

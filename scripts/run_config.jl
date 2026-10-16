@@ -78,11 +78,14 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     #####
 
     # [model]: the numerics of a run. Nx even: the transport section sits at the
-    # x-face Nx/2 + 1.
+    # x-face Nx/2 + 1. architecture: "reactant" compiles the runs (XLA) and
+    # differentiates through the compiled graph; "cpu" runs plain Julia on
+    # Oceananigans' CPU architecture and differentiates with Enzyme directly.
     function parse_model_config(d, w)
-        keys_ = ("Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi")
+        keys_ = ("architecture", "Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi")
         only_config_keys(d, keys_, w)
-        return (; Nx = config_value(d, "Nx", Int, w; check = n -> n ≥ 2 && iseven(n), why = "must be an even integer ≥ 2"),
+        return (; architecture = config_choice(d, "architecture", ("reactant", "cpu"), w),
+                  Nx = config_value(d, "Nx", Int, w; check = n -> n ≥ 2 && iseven(n), why = "must be an even integer ≥ 2"),
                   Ny = config_value(d, "Ny", Int, w; check = ≥(2), why = "must be ≥ 2"),
                   dt = config_value(d, "dt", Float64, w; check = >(0), why = "must be > 0 (seconds)"),
                   advection = config_choice(d, "advection", ("centered", "weno"), w),
