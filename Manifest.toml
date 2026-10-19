@@ -271,9 +271,9 @@ version = "0.13.216"
     StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [[deps.EnzymeCore]]
-git-tree-sha1 = "156ede9181d50b3b21b74d98a7edb08bc7bbdbf1"
+git-tree-sha1 = "c7059e6780f9191e2b05961353986dd9270ffc10"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.23"
+version = "0.8.25"
 
     [deps.EnzymeCore.extensions]
     AdaptExt = "Adapt"
@@ -285,9 +285,9 @@ version = "0.8.23"
 
 [[deps.Enzyme_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "e1844b5fa5695a2f3b510978b2c461c9a99b880f"
+git-tree-sha1 = "1044bbf0dd0d642940c05f0895f651878f0ffb9e"
 uuid = "7cc45869-7501-5eee-bdea-0790c847d4ef"
-version = "0.0.303+0"
+version = "0.0.303+1"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "d2e49e7efd29719d6f28b891b0e0e159daa9d2b4"
@@ -366,9 +366,9 @@ version = "1.23.0"
     NVPTX_LLVM_Backend_jll = "ef6e0fe3-e6ef-59c0-bde6-4989574699e0"
 
 [[deps.GPUToolbox]]
-git-tree-sha1 = "ac858e66e7bee15ccc5931967260db8fe051e2a6"
+git-tree-sha1 = "93bbeddde44f51dd7fc79f4ebe627c4c57a3719a"
 uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
-version = "3.3.3"
+version = "3.4.1"
 
 [[deps.GibbsSeaWater]]
 deps = ["GibbsSeaWater_jll", "Libdl", "Test"]
@@ -434,9 +434,9 @@ version = "1.8.0"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "4657a834b01ce00f2b94546095c4350617b9af2c"
+git-tree-sha1 = "9939eb6f799a963b3392ac4a1d49d3fc0646eb80"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.10.0"
+version = "1.11.0"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -775,9 +775,9 @@ version = "1.3.4"
 
 [[deps.Preferences]]
 deps = ["TOML"]
-git-tree-sha1 = "5005266de4bfe50e53ff44a5cb5c540b6e47a254"
+git-tree-sha1 = "aef1987d90dcc2e2cbd919ad10b2d25bcce4f418"
 uuid = "21216c6a-2e73-6563-6e65-726566657250"
-version = "1.6.0"
+version = "1.6.1"
 
 [[deps.PrettyTables]]
 deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "StyledStrings", "Tables"]
@@ -836,9 +836,9 @@ version = "1.6.0"
 
 [[deps.Reactant]]
 deps = ["Adapt", "BFloat16s", "CEnum", "Crayons", "Downloads", "EnumX", "Enzyme", "EnzymeCore", "FileWatching", "Functors", "GPUArraysCore", "GPUCompiler", "JSON", "LLVM", "LLVMOpenMP_jll", "Libdl", "LinearAlgebra", "OrderedCollections", "PrecompileTools", "Preferences", "PrettyTables", "ProtoBuf", "Random", "ReactantCore", "Reactant_jll", "SHA", "ScopedValues", "Scratch", "Serialization", "Setfield", "Sockets", "StableRNGs", "StructUtils", "StyledStrings", "UUIDs", "p7zip_jll"]
-git-tree-sha1 = "aeb8d2f054d443d421fa096b4e21b322c552157d"
+git-tree-sha1 = "7b816086981b6b05ff39f986dba635fa7584262f"
 uuid = "3c362404-f566-11ee-1572-e11a4b42c853"
-version = "0.2.292"
+version = "0.2.295"
 
     [deps.Reactant.extensions]
     ReactantAbstractFFTsExt = "AbstractFFTs"
@@ -916,9 +916,9 @@ version = "0.1.26"
 
 [[deps.Reactant_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "d937ef36ee52bef9aab5da6cd8087e2103be433d"
+git-tree-sha1 = "1467356435133b7276623daefa478a23e8b4e66d"
 uuid = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
-version = "0.0.418+0"
+version = "0.0.424+0"
 
 [[deps.RealDot]]
 deps = ["LinearAlgebra"]

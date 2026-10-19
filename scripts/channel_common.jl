@@ -57,6 +57,13 @@ using Oceananigans.Architectures: ReactantState, on_architecture
 
 using ReactantCore: Binomial
 
+const FIXED_REACTANT_COMPILE_OPTIONS = Reactant.CompileOptions(;
+    raise = true, raise_first = true, sync = true,
+    disable_scatter_gather_optimization_passes = true)
+
+const FLAWED_REACTANT_COMPILE_OPTIONS = Reactant.CompileOptions(;
+    raise = true, raise_first = true, sync = true)
+
 using Enzyme
 
 Enzyme.API.strictAliasing!(false)
