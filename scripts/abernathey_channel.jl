@@ -134,13 +134,18 @@ function estimate_tracer_error(model, inputs, state, x_midpoint, Ntimesteps)
 
     Nx, Ny, Nz = size(model.grid)
 
+    # Fields are read through interior(...), never by range-indexing the Field:
+    # since Oceananigans 0.117 `field[i, 1:Ny, 1:Nz]` drops the halo offset under
+    # Reactant and reads the parent array (halo cells included), which made J
+    # wrong and, through stale halos, different from one window to the next.
+
     # Term 1 — midline zonal transport (Sv):
-    zonal_transport = (model.velocities.u[x_midpoint,1:Ny,1:Nz] .* model.grid.Δyᵃᶜᵃ) .* inputs.Δz
+    zonal_transport = (interior(model.velocities.u)[x_midpoint, :, :] .* model.grid.Δyᵃᶜᵃ) .* inputs.Δz
     J_transport = sum(zonal_transport) / 1e6
 
     # Term 2 — zonally-averaged stratification b̄(y,z) = ⟨α g T⟩ₓ, reduced to a
     # scalar via its squared magnitude:
-    T = model.tracers.T[1:Nx, 1:Ny, 1:Nz]
+    T = interior(model.tracers.T)
     b = (α * g) .* T                       # linear-EOS buoyancy (thermal part) while S is uniform; with the
                                            # spice anomaly on it is b + g β_S S′, so this sensitivity
                                            # objective then also sees spice (and hence κ_symmetric)
@@ -154,7 +159,7 @@ function estimate_tracer_error(model, inputs, state, x_midpoint, Ntimesteps)
     names = other_tracer_names(model)
     if !isempty(names)
         J_tracers = sum(names) do name
-            c_zonal = sum(model.tracers[name][1:Nx, 1:Ny, 1:Nz], dims = 1) ./ Nx
+            c_zonal = sum(interior(model.tracers[name]), dims = 1) ./ Nx
             sum(c_zonal .^ 2) / (Ny * Nz)
         end
         J = J + w_tracers * J_tracers
