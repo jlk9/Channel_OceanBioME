@@ -419,13 +419,21 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
     # Smooth, fully-Float64 advection for gradient verification; WENO for production.
     advection = use_smooth_advection ? Centered(order=2) : WENO(order=3)
 
+    # Tracer advection: `advection` for T and S (and CATKE's e); first-order
+    # upwind for a biogeochemistry's tracers (biogeochemical_tracer_advection).
+    tracer_advection = biogeochemistry === nothing ? advection :
+        merge(NamedTuple{model_tracer_names(biogeochemistry)}(
+                  map(n -> n in (:T, :S) ? advection : biogeochemical_tracer_advection(),
+                      model_tracer_names(biogeochemistry))),
+              use_catke ? (; e = advection) : (;))
+
     @info "Building a model..."
 
     model = HydrostaticFreeSurfaceModel(
         grid;
         free_surface = SplitExplicitFreeSurface(substeps=free_surface_substeps),
         momentum_advection = advection,
-        tracer_advection = advection,
+        tracer_advection = tracer_advection,
         #buoyancy = SeawaterBuoyancy(equation_of_state=SeawaterPolynomials.TEOS10EquationOfState(Oceananigans.defaults.FloatType)),
         buoyancy = SeawaterBuoyancy(equation_of_state=LinearEquationOfState(Oceananigans.defaults.FloatType,
                                                                             thermal_expansion=α, haline_contraction=β_S)),
@@ -476,6 +484,21 @@ const npzd_initial_conditions = (; N_surface = 2.0,  N_deep = 15.0, h_N = 300.0,
                                    P_background = 0.01, P_surface = 0.5, h_P = 50.0,  # phytoplankton
                                    Z_background = 0.01, Z_surface = 0.2, h_Z = 50.0,  # zooplankton
                                    D_background = 0.01, D_surface = 0.1, h_D = 200.0) # detritus
+
+# ADVECTION OF THE BIOGEOCHEMICAL TRACERS: first-order upwind, whatever [model]
+# advection says for momentum, T and S. It is the positivity-preserving choice:
+# Centered(order=2) undershoots at the grid scale in the sheared flow at the
+# corners of the wall's gap, where zooplankton went negative on day 3 of a
+# spinup (cell (19, 39, 29) at 40x80x32) and every NPZD tracer was NaN by day 4
+# (OceanBioME's fractional powers). Tested over a 31-day spinup, 2026-11-11:
+# a horizontal diffusivity of 1000 m²/s and UpwindBiased(order=3) both still go
+# negative (days 5 and 6); order 1 stays positive throughout. It is very
+# diffusive, which does not matter here, and Float64 throughout (no smoothness
+# indicators, unlike WENO), so it puts no noise floor on J. It is linear in the
+# tracer but switches stencil on the SIGN of the velocity: J is continuous
+# there, with a kink where a face velocity crosses zero.
+biogeochemical_tracer_advection() = UpwindBiased(order = 1)
+biogeochemical_tracer_advection_name() = biogeochemistry_choice == "none" ? "" : "UpwindBiased(order=1)"
 
 # Set the biogeochemical tracers' initial values on `model`, right after
 # build_model (the driver then copies them into the analytic initial state).
@@ -878,6 +901,47 @@ function capture_model_state!(state, model)
     capture_closure_state!(state, model)
     copyto!(state.time, fill(convert(Float64, model.clock.time)))
     return state
+end
+
+#####
+##### Sanity check of the window's starting state
+#####
+# Host-side, right before the window is used (after the spinup, or after a state
+# is loaded). Errors when the state cannot give a meaningful J or gradient:
+#   * any non-finite value in any ModelState array (a spinup that blew up);
+#   * a negative value in a biogeochemical tracer (every tracer but T, S, e).
+#     OceanBioME raises concentrations to fractional powers, so a negative one
+#     turns into NaN within a few steps and spreads through the coupled tracers.
+#     (Dry cells hold 0, which is fine.)
+# Without it a NaN state runs on silently: J is NaN, the determinism probe
+# compares NaN with NaN, and the failure only shows as a NaN gradient.
+function check_window_state(state; origin = "the spinup")
+    problems = String[]
+    function scan(name, a; nonnegative = false)
+        h = state_to_host(a)
+        nbad = count(!isfinite, h)
+        nbad > 0 && push!(problems, "$name: $nbad of $(length(h)) entries are not finite")
+        if nonnegative && nbad < length(h)
+            nneg = count(x -> isfinite(x) && x < 0, h)
+            if nneg > 0
+                v, I = findmin(x -> isfinite(x) ? x : Inf, h)
+                push!(problems, @sprintf("%s: %d negative entries, minimum %.3e at (i, j, k) = %s", name, nneg, v, Tuple(I)))
+            end
+        end
+    end
+    for name in keys(state.tracers)
+        scan(String(name), state.tracers[name]; nonnegative = !(name in (:T, :S, :e)))
+    end
+    for name in (:u, :v, :w, :η, :U, :V)
+        scan(String(name), getfield(state, name))
+    end
+    isempty(problems) && return nothing
+    error("""
+        The window's starting state (from $origin) is unusable:
+          $(join(problems, "\n  "))
+        A non-finite state gives J = NaN and a NaN gradient. A negative biogeochemical
+        tracer becomes NaN within a few steps (fractional powers in OceanBioME). Shorten
+        the spinup, or make the tracer transport positivity-preserving.""")
 end
 
 #####
@@ -1389,6 +1453,7 @@ code_constants() = (; coriolis_f              = f,
                       free_surface_substeps,
                       vertical_mixing_details = vertical_mixing_details(),   # CATKE's parameters ("" without)
                       biogeochemistry_initial_conditions = biogeochemistry_initial_conditions(),  # "" without
+                      biogeochemical_tracer_advection    = biogeochemical_tracer_advection_name(), # "" without
                       forcing_parameters      = parameters)
 
 # Metadata common to init and final files: the code-level constants, a few

@@ -303,6 +303,11 @@ if !load_spunup_state
     @show spinup_toc
 end
 
+# The window's starting state must be finite, with non-negative biogeochemical
+# tracers (check_window_state, channel_common.jl): otherwise stop here, before
+# anything is saved or differentiated.
+check_window_state(spunup_state; origin = load_spunup_state ? spunup_state_path : "the $Nspinup-step spinup")
+
 # Per-run metadata (the values that live in this script, not channel_common.jl).
 # Δt₀ is the configured timestep; the actual value used is also saved as
 # clock_last_dt by common_save_metadata. The κ values are in common_save_metadata.

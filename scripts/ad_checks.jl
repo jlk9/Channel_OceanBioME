@@ -354,6 +354,11 @@ if !@isdefined(_AD_CHECKS_LOADED)
         end
         J₀′ = J()
 
+        # NaN === NaN, so a non-finite J would pass the bitwise test below.
+        all(isfinite, (J₀, J₁, J₀′)) ||
+            error("DETERMINISM PROBE: J is not finite (J(p₀) = $J₀, J(p₁) = $J₁, J(p₀) again = $J₀′); " *
+                  "the window's state or inputs hold NaN/Inf, so nothing can be verified")
+
         J₁ != J₀ || @warn "determinism probe: J(p₁) == J(p₀), so the window in between did not " *
                           "differ from the probed one and the probe proves little"
         J₀′ === J₀ || error("""
