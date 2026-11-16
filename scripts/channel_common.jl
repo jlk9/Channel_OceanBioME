@@ -514,9 +514,22 @@ Oceananigans.Biogeochemistry.required_biogeochemical_tracers(::PassiveCarbonateT
 # organic matter, sPOM sinking at 3.0 m/day and bPOM at 200 m/day out of an open
 # bottom; no temperature dependence, no carbonate system); plain-number
 # parameters as for NPZD. "carbonate": PassiveCarbonateTracers.
+#
+# LOBSTER RUNS WITH scale_negatives = true (OceanBioME's ScaleNegativeTracers
+# modifier, which all of OceanBioME's LOBSTER examples use): after every
+# update_state!, in each cell where a tracer is negative, the negative ones are
+# zeroed and the positive ones rescaled so total nitrogen is conserved. Without
+# it the month-long spinup fails (2026-11-16): LOBSTER's NH₄ half-saturation
+# is 0.001 mmol N/m³, while one 600 s step of uptake at P ≈ 1–3 removes
+# ~0.005–0.03, so the explicit step overshoots below zero from day 1; once
+# NH₄ < −K the Monod term NH₄/(NH₄ + K) passes its pole and NH₄ runs away to
+# ≈ −2.4 (day 3.5), dragging NO₃ negative from day 5. Cost for AD: J has a kink
+# wherever the rescaling switches on during the window (FD degrades there; the
+# forward-mode check does not). A cell whose nitrogen total is negative would
+# be filled with NaN (invalid_fill_value), which check_window_state catches.
 build_biogeochemistry(grid) =
     biogeochemistry_choice == "npzd"      ? OceanBioME.NPZD(grid) :
-    biogeochemistry_choice == "lobster"   ? OceanBioME.LOBSTER(grid) :
+    biogeochemistry_choice == "lobster"   ? OceanBioME.LOBSTER(grid; scale_negatives = true) :
     biogeochemistry_choice == "carbonate" ? PassiveCarbonateTracers() : nothing
 
 # NPZD initial conditions [mmol N/m³], functions of depth only, smooth and
@@ -607,6 +620,9 @@ function set_biogeochemical_initial_conditions!(model, ::Val{:carbonate})
     @allowscalar set!(model, DIC = DICᵢ, Alk = Alkᵢ)
     return nothing
 end
+
+# The non-default constructor options of the biogeochemistry, for code_constants.
+biogeochemistry_options() = biogeochemistry_choice == "lobster" ? "LOBSTER(grid; scale_negatives = true)" : ""
 
 biogeochemistry_initial_conditions() =
     biogeochemistry_choice == "npzd"      ? sprint(show, npzd_initial_conditions) :
@@ -1817,6 +1833,7 @@ code_constants() = (; coriolis_f              = f,
                       free_surface_substeps,
                       vertical_mixing_details = vertical_mixing_details(),   # CATKE's parameters ("" without)
                       biogeochemistry_initial_conditions = biogeochemistry_initial_conditions(),  # "" without
+                      biogeochemistry_options            = biogeochemistry_options(),             # "" without
                       biogeochemical_tracer_advection    = biogeochemical_tracer_advection_name(), # "" without
                       carbon_chemistry                   = carbon_chemistry_details(),              # "" without
                       co2_exchange                       = co2_gas_exchange_details(),              # "" without
