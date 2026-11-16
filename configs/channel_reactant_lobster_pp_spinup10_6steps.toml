@@ -1,0 +1,53 @@
+# Run config: run with
+#   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
+#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_reactant_lobster_pp_spinup10_6steps.toml
+# Output: runs/channel_reactant_lobster_pp_spinup10_6steps/. Every key is required;
+# see scripts/run_config.jl for the rules. Values are SI.
+#
+# Stage 4 of the OceanBioME roadmap: OceanBioME's LOBSTER (defaults) in the
+# channel, its tracers first-order upwind advected (positivity), and
+# J = column-integrated primary production (OceanBioME's primary_production, in
+# carbon) at the end of a 6-step window, mean over the wet columns.
+# Determinism probe, forward-mode and FD checks (upwind kinks: FD converges only
+# linearly in directions that move the flow; forward mode is the clean check).
+
+[model]
+architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+Nx = 40
+Ny = 80
+dt = 600.0                       # s
+advection = "centered"           # "centered" (smooth; needed for the FD check) or "weno"
+vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
+fill_kappa_halos = true           # false only to reproduce runs made before the κ halo fix
+gmredi = false                    # false: no GM/Redi (then no [kappa])
+biogeochemistry = "lobster"      # "none", "npzd", "lobster" or "carbonate" (build_biogeochemistry)
+co2_gas_exchange = false          # air–sea CO₂ flux on DIC (needs biogeochemistry = "carbonate"; stage 2)
+
+[run]
+Nspinup = 10                     # 10 steps (100 min)
+Ntimesteps = 6                   # 6 steps (1 hour): the estimate window (the AD'd part)
+spunup_state = ""                # "" = spin up here; else a saved data_init/data_final.jld2
+
+[spice]                          # density-compensated salinity anomaly (spice_anomaly)
+S0 = 35.0                        # psu, reference salinity
+dS = 0.0                         # psu, amplitude; 0 = off
+y = 800e3                        # m, centre (meridional)
+L = 250e3                        # m, Gaussian width (meridional)
+z = -800.0                       # m, centre (vertical)
+H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
+
+[objective]                      # the scalar J (run_config.jl lists the choices)
+name = "primary_production"
+
+[checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
+determinism_probe = true         # J bitwise reproducible after an AD call at other inputs (~1 AD + 2 forward calls)
+forward_check = true             # forward-mode (JVP) vs reverse-mode directional derivatives (1 forward-mode window per direction)
+fd_check = true                  # FD vs AD directional derivatives (2 forward windows per ε per direction)
+directions_seed = 2026           # seeds every direction (forward-mode and FD checks)
+directions_random = 2            # directions over all inputs at once
+# One direction per input listed (the log lists the model's inputs; biogeochemical
+# tracers appear under their names):
+directions_components = ["NO₃", "NH₄", "P", "Z", "DOM", "sPOM", "bPOM",
+                         "T", "S", "u", "v",
+                         "u_wind_stress", "v_wind_stress", "temp_flux",
+                         "kappa_z"]

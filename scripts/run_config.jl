@@ -81,7 +81,8 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     # x-face Nx/2 + 1. architecture: "reactant" compiles the runs (XLA) and
     # differentiates through the compiled graph; "cpu" runs plain Julia on
     # Oceananigans' CPU architecture and differentiates with Enzyme directly.
-    # biogeochemistry: "none", "npzd" (OceanBioME's NPZD with its defaults), or
+    # biogeochemistry: "none", "npzd" (OceanBioME's NPZD with its defaults),
+    # "lobster" (OceanBioME's LOBSTER with its defaults: stage 4), or
     # "carbonate" (passive DIC and Alk tracers, no sources: the stage-1 carbonate
     # chemistry test), built by build_biogeochemistry in channel_common.jl.
     # co2_gas_exchange: an air–sea CO₂ flux on DIC's top boundary (OceanBioME's
@@ -99,7 +100,7 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   vertical_mixing = config_choice(d, "vertical_mixing", ("catke", "scalar_surface_taper"), w),
                   fill_kappa_halos = config_value(d, "fill_kappa_halos", Bool, w),
                   gmredi = config_value(d, "gmredi", Bool, w),
-                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd", "carbonate"), w),
+                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd", "lobster", "carbonate"), w),
                   co2_gas_exchange = config_value(d, "co2_gas_exchange", Bool, w))
         model.co2_gas_exchange && model.biogeochemistry != "carbonate" &&
             error("$w: co2_gas_exchange = true needs DIC and Alk: set biogeochemistry = \"carbonate\" " *
@@ -173,7 +174,15 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     #                    into the ocean] over the wet top-layer cells at the end
     #                    of the window: the flux DIC's gas-exchange boundary
     #                    condition applies. Needs co2_gas_exchange = true.
-    const OBJECTIVES = ("default", "surface_pco2", "co2_uptake")
+    #   "primary_production" — column-integrated primary production [mmol C
+    #                    m⁻² day⁻¹], mean over the wet columns, at the end of
+    #                    the window (OceanBioME's primary_production).
+    #   "export_production"  — the sinking flux of organic matter through the
+    #                    face nearest 100 m [mmol C m⁻² day⁻¹], mean over the wet
+    #                    columns, at the end of the window.
+    #                    Both need a NutrientsPlanktonDetritus model:
+    #                    biogeochemistry = "npzd" or "lobster".
+    const OBJECTIVES = ("default", "surface_pco2", "co2_uptake", "primary_production", "export_production")
 
     function parse_objective_config(d, w, model)
         only_config_keys(d, ("name",), w)
@@ -183,6 +192,9 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   "(it is \"$(model.biogeochemistry)\")")
         objective.name == "co2_uptake" && !model.co2_gas_exchange &&
             error("$w: name = \"co2_uptake\" is the flux of the air–sea CO₂ exchange: set [model] co2_gas_exchange = true")
+        objective.name in ("primary_production", "export_production") && !(model.biogeochemistry in ("npzd", "lobster")) &&
+            error("$w: name = \"$(objective.name)\" needs a NutrientsPlanktonDetritus model: set [model] biogeochemistry " *
+                  "= \"npzd\" or \"lobster\" (it is \"$(model.biogeochemistry)\")")
         return objective
     end
 

@@ -508,9 +508,15 @@ Oceananigans.Biogeochemistry.required_biogeochemical_tracers(::PassiveCarbonateT
 # surface PAR of 100 W/m², so no clock dependence; detritus sinking out of an
 # open bottom; no sediment, no negative-tracer modifiers). Its parameters are
 # plain numbers, baked into a compiled graph: no gradient, no FD perturbation.
-# "carbonate": PassiveCarbonateTracers.
+# "lobster": OceanBioME's LOBSTER preset with all its defaults (the same
+# NutrientsPlanktonDetritus framework, PhytoZoo plankton and two-band light as
+# NPZD; nitrate + ammonia nutrients; dissolved + small and big particulate
+# organic matter, sPOM sinking at 3.0 m/day and bPOM at 200 m/day out of an open
+# bottom; no temperature dependence, no carbonate system); plain-number
+# parameters as for NPZD. "carbonate": PassiveCarbonateTracers.
 build_biogeochemistry(grid) =
     biogeochemistry_choice == "npzd"      ? OceanBioME.NPZD(grid) :
+    biogeochemistry_choice == "lobster"   ? OceanBioME.LOBSTER(grid) :
     biogeochemistry_choice == "carbonate" ? PassiveCarbonateTracers() : nothing
 
 # NPZD initial conditions [mmol N/m³], functions of depth only, smooth and
@@ -523,6 +529,19 @@ const npzd_initial_conditions = (; N_surface = 2.0,  N_deep = 15.0, h_N = 300.0,
                                    P_background = 0.01, P_surface = 0.5, h_P = 50.0,  # phytoplankton
                                    Z_background = 0.01, Z_surface = 0.2, h_Z = 50.0,  # zooplankton
                                    D_background = 0.01, D_surface = 0.1, h_D = 200.0) # detritus
+
+# LOBSTER initial conditions [mmol N/m³], the same construction as NPZD's
+# (depth only, smooth, strictly positive): nitrate poor at the surface, rich at
+# depth; ammonia, plankton, dissolved and particulate organic matter
+# surface-intensified over small positive backgrounds. Magnitudes after
+# OceanBioME's LOBSTER examples (P = Z = 0.03, NO₃ = 4, NH₄ = 0.05 there).
+const lobster_initial_conditions = (; NO₃_surface = 2.0,  NO₃_deep = 15.0, h_NO₃ = 300.0,      # nitrate; h in m
+                                      NH₄_background = 0.01, NH₄_surface = 0.1,  h_NH₄ = 50.0,  # ammonia
+                                      P_background = 0.01, P_surface = 0.3,  h_P = 50.0,        # phytoplankton
+                                      Z_background = 0.01, Z_surface = 0.1,  h_Z = 50.0,        # zooplankton
+                                      DOM_background = 0.01, DOM_surface = 0.1, h_DOM = 200.0,  # dissolved organic
+                                      sPOM_background = 0.005, sPOM_surface = 0.05, h_sPOM = 200.0,  # small particulate
+                                      bPOM_background = 0.001, bPOM_surface = 0.01, h_bPOM = 200.0)  # big particulate
 
 # ADVECTION OF THE BIOGEOCHEMICAL TRACERS: first-order upwind, whatever [model]
 # advection says for momentum, T and S. It is the positivity-preserving choice:
@@ -567,6 +586,20 @@ end
 const carbonate_initial_conditions = (; DIC_surface = 2100.0, DIC_deep = 2250.0, h_DIC = 500.0,
                                         Alk_surface = 2300.0, Alk_deep = 2380.0, h_Alk = 500.0)
 
+function set_biogeochemical_initial_conditions!(model, ::Val{:lobster})
+    c = lobster_initial_conditions
+    surface(bg, s, h) = (x, y, z) -> bg + s * exp(z / h)
+    NO₃ᵢ(x, y, z) = c.NO₃_deep + (c.NO₃_surface - c.NO₃_deep) * exp(z / c.h_NO₃)
+    @allowscalar set!(model, NO₃ = NO₃ᵢ,
+                      NH₄  = surface(c.NH₄_background,  c.NH₄_surface,  c.h_NH₄),
+                      P    = surface(c.P_background,    c.P_surface,    c.h_P),
+                      Z    = surface(c.Z_background,    c.Z_surface,    c.h_Z),
+                      DOM  = surface(c.DOM_background,  c.DOM_surface,  c.h_DOM),
+                      sPOM = surface(c.sPOM_background, c.sPOM_surface, c.h_sPOM),
+                      bPOM = surface(c.bPOM_background, c.bPOM_surface, c.h_bPOM))
+    return nothing
+end
+
 function set_biogeochemical_initial_conditions!(model, ::Val{:carbonate})
     c = carbonate_initial_conditions
     DICᵢ(x, y, z) = c.DIC_deep + (c.DIC_surface - c.DIC_deep) * exp(z / c.h_DIC)
@@ -577,6 +610,7 @@ end
 
 biogeochemistry_initial_conditions() =
     biogeochemistry_choice == "npzd"      ? sprint(show, npzd_initial_conditions) :
+    biogeochemistry_choice == "lobster"   ? sprint(show, lobster_initial_conditions) :
     biogeochemistry_choice == "carbonate" ? sprint(show, carbonate_initial_conditions) : ""
 
 #####
@@ -741,6 +775,86 @@ function surface_CO₂_uptake!(uptake, model)
     exchange = tr.DIC.boundary_conditions.top.condition.func   # OceanBioME's GasExchange
     launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _surface_CO₂_uptake!,
             uptake, grid, exchange, model.clock, (; tr.T, tr.S, tr.DIC, tr.Alk))
+    return nothing
+end
+
+#####
+##### Production diagnostics of the NutrientsPlanktonDetritus models (stage 4;
+##### objectives "primary_production" and "export_production")
+#####
+# Both in carbon units, mmol C m⁻² day⁻¹, from OceanBioME's own functions, and
+# per wet column (2-D Fields, zero on dry columns), so each objective is their
+# mean over the wet columns. Nitrogen is converted with OceanBioME's
+# carbon_ratio(plankton, bgc) (6.56 mol C / mol N for NPZD and LOBSTER).
+const NPDModels = OceanBioME.Models.NutrientsPlanktonDetritusModels
+
+# PRIMARY PRODUCTION: OceanBioME's primary_production(i, j, k, grid, plankton,
+# bgc, fields, auxiliary_fields) [mmol C m⁻³ s⁻¹] (carbon_ratio × nutrient
+# uptake), integrated over each column (Σ_k PP Δz, a static loop over the
+# column, as OceanBioME's light kernels do). `fields` holds the tracers and the
+# biogeochemistry's auxiliary fields (PAR), as the model's transition kernels
+# see them; `aux` is the biogeochemistry's auxiliary fields, which
+# DiscreteBiogeochemistry appends to every call.
+@kernel function _column_primary_production!(PP, grid, plankton, bgc, fields, aux)
+    i, j = @index(Global, NTuple)
+    Nz = size(grid, 3)
+    s = zero(eltype(grid))
+    for k in 1:Nz
+        p = NPDModels.InorganicCarbonModels.primary_production(i, j, k, grid, plankton, bgc, fields, aux)
+        s += ifelse(Oceananigans.Grids.inactive_cell(i, j, k, grid), zero(p), p) * Oceananigans.Operators.Δzᶜᶜᶜ(i, j, k, grid)
+    end
+    @inbounds PP[i, j, 1] = ifelse(Oceananigans.Grids.inactive_cell(i, j, Nz, grid), zero(s), s * 86400)
+end
+
+function column_primary_production!(PP, model)
+    grid = model.grid
+    bgc = model.biogeochemistry.underlying_biogeochemistry
+    aux = Oceananigans.Biogeochemistry.biogeochemical_auxiliary_fields(model.biogeochemistry)
+    launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _column_primary_production!,
+            PP, grid, bgc.plankton, bgc, merge(model.tracers, aux), aux)
+    return nothing
+end
+
+# EXPORT PRODUCTION: the sinking flux of organic matter through the z-face
+# nearest export_depth, Σ over the sinking tracers of −w_sink · C, with C from
+# the cell just above the face: exactly the first-order upwind flux the model
+# applies there (biogeochemical_tracer_advection; w_sink < 0). Positive
+# downward, converted to carbon.
+const export_depth = 100.0   # [m], target depth of the export face
+
+# The z-face index nearest export_depth (z_faces[k] is the bottom face of cell k).
+export_face_index() = argmin(abs.(z_faces .+ export_depth))
+
+# The biogeochemistry's tracers that sink (a drift velocity with a w Field).
+function sinking_tracer_names(bgc)
+    names = Oceananigans.Biogeochemistry.required_biogeochemical_tracers(bgc)
+    return filter(names) do n
+        d = Oceananigans.Biogeochemistry.biogeochemical_drift_velocity(bgc, Val(n))
+        d isa NamedTuple && !(d.w isa Oceananigans.Fields.ZeroField)
+    end
+end
+
+@inline sinking_flux(::Tuple{}, i, j, k) = 0.0
+@inline function sinking_flux(s::Tuple, i, j, k)
+    w, c = first(s)
+    return @inbounds(-w[i, j, k] * c[i, j, k]) + sinking_flux(Base.tail(s), i, j, k)
+end
+
+@kernel function _export_flux!(E, grid, k, sinking, carbon_per_nitrogen)
+    i, j = @index(Global, NTuple)
+    F = sinking_flux(sinking, i, j, k)   # mmol N m⁻² s⁻¹, downward
+    @inbounds E[i, j, 1] = ifelse(Oceananigans.Grids.inactive_cell(i, j, k, grid), zero(F), carbon_per_nitrogen * F * 86400)
+end
+
+# `names`: the sinking tracers (sinking_tracer_names, a constant tuple); `k`:
+# the export face (export_face_index()).
+function export_flux!(E, model, names, k)
+    grid = model.grid
+    bgc = model.biogeochemistry
+    sinking = map(n -> (Oceananigans.Biogeochemistry.biogeochemical_drift_velocity(bgc, Val(n)).w, model.tracers[n]), names)
+    npd = bgc.underlying_biogeochemistry
+    launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _export_flux!,
+            E, grid, k, sinking, NPDModels.carbon_ratio(npd.plankton, npd))
     return nothing
 end
 

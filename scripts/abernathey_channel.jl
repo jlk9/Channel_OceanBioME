@@ -204,11 +204,34 @@ function window_objective(::Val{:co2_uptake}, model, inputs, x_midpoint)
     return sum(interior(uptake)) / n_wet_surface
 end
 
+# "primary_production" (stage 4): column-integrated primary production [mmol C
+# m⁻² day⁻¹] at the end of the window, mean over the wet columns, from
+# OceanBioME's own primary_production (column_primary_production!,
+# channel_common.jl). Instantaneous; a time-integrated version needs an
+# accumulator carried through the window.
+function window_objective(::Val{:primary_production}, model, inputs, x_midpoint)
+    PP = model.auxiliary_fields.primary_production
+    column_primary_production!(PP, model)
+    return sum(interior(PP)) / n_wet_surface
+end
+
+# "export_production" (stage 4): the sinking flux of organic matter through the
+# face nearest 100 m [mmol C m⁻² day⁻¹] at the end of the window, mean over the
+# wet columns there (export_flux!, channel_common.jl): the model's own upwind
+# sinking flux of every sinking tracer (SINKING_TRACERS), in carbon.
+function window_objective(::Val{:export_production}, model, inputs, x_midpoint)
+    E = model.auxiliary_fields.export_production
+    export_flux!(E, model, SINKING_TRACERS, k_export)
+    return sum(interior(E)) / n_wet_export
+end
+
 # The diagnostic Fields an objective writes inside the compiled window, handed to
 # build_model as auxiliary_fields (so they are part of the model and its shadow).
 objective_auxiliary_fields(::Val{:default}, grid) = NamedTuple()
 objective_auxiliary_fields(::Val{:surface_pco2}, grid) = (; pCO₂ = Field{Center, Center, Nothing}(grid))
 objective_auxiliary_fields(::Val{:co2_uptake}, grid) = (; CO₂_uptake = Field{Center, Center, Nothing}(grid))
+objective_auxiliary_fields(::Val{:primary_production}, grid) = (; primary_production = Field{Center, Center, Nothing}(grid))
+objective_auxiliary_fields(::Val{:export_production}, grid) = (; export_production = Field{Center, Center, Nothing}(grid))
 
 function differentiate_tracer_error(model, inputs, state, dmodel, dinputs, dstate, x_midpoint, Ntimesteps)
 
@@ -275,8 +298,20 @@ report_biogeochemical_state(model)
 # compiled graph. check_surface_objective verifies it against the kernel's own
 # dry test after the first evaluation.
 const n_wet_surface = count(fd_wet_masks(model).c[:, :, Nz])
+
+# The export_production objective's face (the z-face nearest export_depth, the
+# bottom face of cell k_export), its wet-cell count, and the sinking tracers
+# whose flux it sums: constants of the grid and the biogeochemistry.
+const k_export = export_face_index()
+const n_wet_export = count(fd_wet_masks(model).c[:, :, k_export])
+const SINKING_TRACERS = biogeochemistry === nothing ? () : Tuple(sinking_tracer_names(biogeochemistry))
+
 @info "Objective: $(RUN_CONFIG.objective.name)" *
-      (OBJECTIVE isa Union{Val{:surface_pco2}, Val{:co2_uptake}} ? " (mean over $n_wet_surface wet surface cells)" : "")
+      (OBJECTIVE isa Union{Val{:surface_pco2}, Val{:co2_uptake}, Val{:primary_production}} ?
+           " (mean over $n_wet_surface wet columns)" :
+       OBJECTIVE isa Val{:export_production} ?
+           @sprintf(" (sinking flux of %s through the face at z = %.2f m, mean over %d wet cells)",
+                    join(SINKING_TRACERS, ", "), z_faces[k_export], n_wet_export) : "")
 
 # A surface objective's mean must be over the cells its kernel computed: the
 # field's nonzero entries must be exactly the wet mask's top layer.
@@ -285,10 +320,16 @@ check_surface_objective(::Val{:surface_pco2}, model) =
     check_surface_field(model.auxiliary_fields.pCO₂, "surface pCO₂", "μatm", model)
 check_surface_objective(::Val{:co2_uptake}, model) =
     check_surface_field(model.auxiliary_fields.CO₂_uptake, "air→sea CO₂ flux", "mmol C m⁻² day⁻¹", model)
+check_surface_objective(::Val{:primary_production}, model) =
+    check_surface_field(model.auxiliary_fields.primary_production, "column primary production", "mmol C m⁻² day⁻¹", model)
+check_surface_objective(::Val{:export_production}, model) =
+    check_surface_field(model.auxiliary_fields.export_production, "export flux at z = $(z_faces[k_export]) m",
+                        "mmol C m⁻² day⁻¹", model; k = k_export)
 
-function check_surface_field(field, what, units, model)
+# `k`: the level whose wet cells the field's mean is over.
+function check_surface_field(field, what, units, model; k = Nz)
     p = to_host(field)[:, :, 1]
-    wet = fd_wet_masks(model).c[:, :, Nz]
+    wet = fd_wet_masks(model).c[:, :, k]
     (p .!= 0) == wet ||
         error("$what: the kernel's wet cells ($(count(!=(0), p))) differ from the wet mask's ($(count(wet)))")
     @info @sprintf("%s at the end of the window: %.4g to %.4g %s (mean %.6g) over %d wet cells",
