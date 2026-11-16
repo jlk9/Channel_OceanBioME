@@ -1,0 +1,48 @@
+# Run config: run with
+#   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
+#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_reactant_carbonate_spinup10_6steps.toml
+# Output: runs/channel_reactant_carbonate_spinup10_6steps/. Every key is required;
+# see scripts/run_config.jl for the rules. Values are SI.
+#
+# Stage 1 of the OceanBioME roadmap: passive DIC and Alk in the channel, and
+# J = mean surface pCO₂ at the end of a 6-step window, through OceanBioME's
+# CarbonChemistry (H⁺ solve). Determinism probe, forward-mode and FD checks.
+
+[model]
+architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+Nx = 40
+Ny = 80
+dt = 600.0                       # s
+advection = "centered"           # "centered" (smooth; needed for the FD check) or "weno"
+vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
+fill_kappa_halos = true           # false only to reproduce runs made before the κ halo fix
+gmredi = false                    # false: no GM/Redi (then no [kappa])
+biogeochemistry = "carbonate"    # "none", "npzd" or "carbonate" (passive DIC, Alk; build_biogeochemistry)
+
+[run]
+Nspinup = 10                     # 10 steps (100 min)
+Ntimesteps = 6                   # 6 steps (1 hour): the estimate window (the AD'd part)
+spunup_state = ""                # "" = spin up here; else a saved data_init/data_final.jld2
+
+[spice]                          # density-compensated salinity anomaly (spice_anomaly)
+S0 = 35.0                        # psu, reference salinity
+dS = 0.0                         # psu, amplitude; 0 = off
+y = 800e3                        # m, centre (meridional)
+L = 250e3                        # m, Gaussian width (meridional)
+z = -800.0                       # m, centre (vertical)
+H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
+
+[objective]                      # the scalar J ("default" or "surface_pco2"; run_config.jl)
+name = "surface_pco2"
+
+[checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
+determinism_probe = true         # J bitwise reproducible after an AD call at other inputs (~1 AD + 2 forward calls)
+forward_check = true             # forward-mode (JVP) vs reverse-mode directional derivatives (1 forward-mode window per direction)
+fd_check = true                  # FD vs AD directional derivatives (2 forward windows per ε per direction)
+directions_seed = 2026           # seeds every direction (forward-mode and FD checks)
+directions_random = 2            # directions over all inputs at once
+# One direction per input listed (the log lists the model's inputs; biogeochemical
+# tracers appear under their names):
+directions_components = ["DIC", "Alk", "T", "S", "u", "v",
+                         "u_wind_stress", "v_wind_stress", "temp_flux",
+                         "kappa_z"]
