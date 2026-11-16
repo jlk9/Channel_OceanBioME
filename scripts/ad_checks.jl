@@ -1,8 +1,8 @@
 # ad_checks.jl
 #
 # Verification of the AD gradient, run by abernathey_channel.jl ([checks] in
-# the run config). Both work host-side, between compiled calls, on the compiled
-# forward and reverse functions the run already has:
+# the run config). All work host-side, between compiled calls, on the compiled
+# forward, reverse and forward-mode functions the run has:
 #
 #   * The DETERMINISM PROBE (determinism_probe): J must be a pure function of its
 #     inputs, because every window restores its starting state (ModelState),
@@ -19,8 +19,8 @@
 #     one AD call) against central differences (J(p₀ + εv) − J(p₀ − εv)) / 2ε,
 #     for ε = FD_EPSILONS. Two kinds of direction:
 #       - random directions over ALL the inputs at once ([checks]
-#         fd_random_directions): the whole gradient;
-#       - one direction per named input ([checks] fd_components): which pathway a
+#         directions_random): the whole gradient;
+#       - one direction per named input ([checks] directions_components): which pathway a
 #         failure is in.
 #     HOW TO READ IT: look for a relative error that keeps FALLING as ε shrinks,
 #     down to a best value, then rises again as round-off takes over (the FD
@@ -30,6 +30,21 @@
 #     line flags whether the error falls monotonically to its best value.
 #     Centered advection is required: WENO's Float32 smoothness indicators put a
 #     ~1e-7 relative noise floor on J that swamps the FD arm.
+#
+#   * The FORWARD-MODE CHECK (run_forward_check): along the SAME directions as
+#     the FD check (same [checks] directions_* keys and seeds), the reverse-mode
+#     ⟨∇J, v⟩ against the forward-mode (Enzyme Forward, a JVP) derivative J̇ = ∂J/∂p · v,
+#     computed in one forward-mode window per direction with v as the tangent
+#     seed. The two are independently generated derivative code, so they must
+#     agree to near round-off, with no step size and NO dependence on J being
+#     smooth: kinks (upwind BGC advection, ISSD at N² = 0, CATKE's branches)
+#     that make the FD table erratic do not affect it. A relative difference
+#     above FORWARD_CHECK_TOL is flagged (a warning, not an error). What it
+#     CANNOT catch: anything wrong in the primal being differentiated (a
+#     parameter baked into the graph gives 0 in both modes; a traced-indexing
+#     bug is differentiated consistently by both). That is what FD is for.
+#     Each direction gets FRESH tangent shadows (make_zero), so stale tangents
+#     in the model's internal buffers (halos, AB2 tendencies) cannot leak in.
 #
 # THE INPUTS CHECKED ("FD components"): every input of J whose AD gradient the
 # run computes and that can be changed host-side between compiled calls:
@@ -77,23 +92,41 @@ if !@isdefined(_AD_CHECKS_LOADED)
     const PROBE_DELTA = 1e-2
     const PROBE_SEED  = 2026
 
+    # The forward-mode check flags a forward/reverse relative difference above
+    # this. Not 1e-14: the reverse value is a host-side sum over ~1e5 entries,
+    # and under Reactant the forward-mode and reverse graphs are compiled (and
+    # fused) separately.
+    const FORWARD_CHECK_TOL = 1e-10
+
+    # ...and measures that difference against max(|J̇|, |reverse|, this·|J|),
+    # never against less. A directional derivative far below |J| (κ_symmetric,
+    # CATKE's e: ~1e-9·|J|) is at J's round-off, and forward and reverse then
+    # differ by ~eps·|J| in absolute terms: relative to the derivative itself
+    # that can exceed the tolerance with nothing wrong. With this floor the
+    # smallest difference ever flagged is TOL·FLOOR·|J| = 1e-16·|J| ≈ eps·|J|/2.
+    # (The directions have RMS = each input's own scale, so J̇ is the change in
+    # J per 100% relative perturbation, comparable with |J|.)
+    const FORWARD_CHECK_FLOOR = 1e-6
+
     #####
     ##### Perturbable inputs
     #####
 
     """
-        FDComponent(name, primal, write!, gradient, mask)
+        FDComponent(name, primal, write!, gradient, seed!, mask)
 
     One input of J for the AD checks: `primal()` returns a host copy of its
     current value (interior), `write!(a)` writes a host array into it,
-    `gradient()` returns a host copy of ∂J/∂(it) from the run's AD call (its
-    shadow), and `mask` marks the wet entries that are perturbed.
+    `gradient()` returns a host copy of its shadow (∂J/∂(it) after a reverse
+    AD call), `seed!(a)` writes a host array into its shadow (the tangent of a
+    forward-mode call), and `mask` marks the wet entries that are perturbed.
     """
     struct FDComponent
         name     :: String
         primal   :: Function
         write!   :: Function
         gradient :: Function
+        seed!    :: Function
         mask     :: BitArray{3}
     end
 
@@ -226,19 +259,24 @@ if !@isdefined(_AD_CHECKS_LOADED)
     # convert(Array, ·) would return the live array itself, so the saved p₀
     # would change with every perturbation and restore! would restore nothing.
     state_component(name, a, da, mask) =
-        FDComponent(name, () -> Array(a), h -> (copyto!(a, h); nothing), () -> Array(da), mask)
+        FDComponent(name, () -> Array(a), h -> (copyto!(a, h); nothing), () -> Array(da),
+                    h -> (copyto!(da, h); nothing), mask)
 
-    # A Field and its shadow Field.
+    # A Field and its shadow Field. A seeded shadow has its interior written,
+    # its halos left zero (make_zero): like the primal, the compiled run fills
+    # the halos it reads, and those fills carry the tangent.
     field_component(name, f, df, mask) =
-        FDComponent(name, () -> to_host(f), h -> write_interior_host!(f, h), () -> to_host(df), mask)
+        FDComponent(name, () -> to_host(f), h -> write_interior_host!(f, h), () -> to_host(df),
+                    h -> write_interior_host!(df, h), mask)
 
     """
         fd_components(model, inputs, state, dmodel, dinputs, dstate) -> Vector{FDComponent}
 
-    Every input the AD checks can perturb (see the header), with the shadows of
-    the run's AD call (`dmodel`, `dinputs`, `dstate`, the same objects that
-    call fills). Cheap: closures and masks only, so it can run before the
-    compile to validate [checks] fd_components.
+    Every input the AD checks can perturb (see the header), with the shadows
+    `dmodel`, `dinputs`, `dstate`: the run's reverse-call shadows (read as
+    gradients), or fresh tangent shadows for a forward-mode call (seeded).
+    Cheap: closures and masks only, so it can run before the compile to
+    validate [checks] directions_components, and once per forward-mode direction.
     """
     function fd_components(model, inputs, state, dmodel, dinputs, dstate)
         masks = fd_wet_masks(model)
@@ -274,14 +312,32 @@ if !@isdefined(_AD_CHECKS_LOADED)
         return comps
     end
 
-    # Check [checks] fd_components against the available inputs. Before the
-    # compile, so a typo fails in seconds. Returns the selected components.
+    # Check [checks] directions_components against the available inputs. Before
+    # the compile, so a typo fails in seconds. Returns the selected components.
     function select_fd_components(comps, names)
         available = [c.name for c in comps]
         unknown = setdiff(names, available)
         isempty(unknown) ||
-            error("[checks] fd_components: unknown $(unknown); this model's inputs are $(available)")
+            error("[checks] directions_components: unknown $(unknown); this model's inputs are $(available)")
         return [comps[findfirst(==(n), available)] for n in names]
+    end
+
+    """
+        check_cases(comps, checks) -> Vector{(label, comps, seed)}
+
+    The directions shared by the FD and forward-mode checks:
+    `checks.directions_random` random directions over all of `comps`, then one
+    confined to each input in `checks.directions_components`, each with a seed
+    drawn from `checks.directions_seed`. Both checks call this with the same
+    arguments, so they see the same directions; each printed seed reruns its
+    direction.
+    """
+    function check_cases(comps, checks)
+        selected = select_fd_components(comps, checks.directions_components)
+        cases = vcat([("random (all inputs)", comps) for _ in 1:checks.directions_random],
+                     [(c.name, [c]) for c in selected])
+        seeds = rand(Xoshiro(checks.directions_seed), 1:typemax(Int32), length(cases))
+        return [(label, cs, seed) for ((label, cs), seed) in zip(cases, seeds)]
     end
 
     #####
@@ -402,17 +458,11 @@ if !@isdefined(_AD_CHECKS_LOADED)
     """
         run_fd_check(J, comps, checks) -> NamedTuple
 
-    The FD check of the run's AD gradient: `checks.fd_random_directions` random
-    directions over all of `comps`, then one direction confined to each input in
-    `checks.fd_components`. Direction seeds are drawn from `checks.fd_seed`, so
-    the check is reproducible; each printed seed reruns its direction. Returns
-    the results table (see save_fd_check).
+    The FD check of the run's AD gradient along the directions of
+    `check_cases(comps, checks)`. Returns the results table (see save_fd_check).
     """
     function run_fd_check(J, comps, checks; epsilons = FD_EPSILONS)
-        selected = select_fd_components(comps, checks.fd_components)
-        cases = vcat([("random (all inputs)", comps) for _ in 1:checks.fd_random_directions],
-                     [(c.name, [c]) for c in selected])
-        seeds = rand(Xoshiro(checks.fd_seed), 1:typemax(Int32), length(cases))
+        cases = check_cases(comps, checks)
 
         @info "FD check: $(length(cases)) directions × $(length(epsilons)) ε × 2 forward windows"
         for c in comps
@@ -421,7 +471,7 @@ if !@isdefined(_AD_CHECKS_LOADED)
                            c.name, fd_scale(c), maximum(abs, g[c.mask]; init = 0.0), count(c.mask))
         end
 
-        results = map(zip(cases, seeds)) do ((label, cs), seed)
+        results = map(cases) do (label, cs, seed)
             @info "FD check: direction $label, seed $seed"
             (; label, seed, fd_check_direction(J, cs, fd_direction(cs, seed); epsilons)...)
         end
@@ -451,6 +501,87 @@ if !@isdefined(_AD_CHECKS_LOADED)
                 fd_J_minus      = reduce(hcat, [r.J_minus for r in rs]),
                 fd_scale_overrides = FD_SCALE_OVERRIDES,
                 config_toml     = RUN_CONFIG.toml,
+                run_provenance()...)
+        return nothing
+    end
+
+    #####
+    ##### Forward-mode check
+    #####
+
+    # Write each direction of `comps` into the shadow of the same-named input
+    # in `tangent_comps` (components built on fresh tangent shadows).
+    function seed_tangents!(tangent_comps, comps, dirs)
+        names = [t.name for t in tangent_comps]
+        for (c, v) in zip(comps, dirs)
+            i = findfirst(==(c.name), names)
+            i === nothing && error("forward-mode check: no tangent for input $(c.name)")
+            tangent_comps[i].seed!(v)
+        end
+        return nothing
+    end
+
+    """
+        run_forward_check(jvp, J, comps, checks) -> NamedTuple
+
+    The forward-mode check of the run's reverse-mode gradient (the shadows
+    behind `comps`) along the directions of `check_cases(comps, checks)`, the
+    FD check's. `jvp(seed!)` makes one forward-mode call at the current inputs
+    with FRESH tangent shadows, after calling `seed!(tangent_comps)` on the
+    components built on them, and returns (J̇, J); `J()` is the forward-only
+    objective at the current inputs, to compare the forward-mode call's J
+    against. Leaves every input as it found it (the forward-mode window moves
+    the model, which every window restores). Flags, but does not error on, a
+    relative difference above FORWARD_CHECK_TOL, measured against
+    max(|J̇|, |reverse|, FORWARD_CHECK_FLOOR·|J|); errors on a non-finite J̇.
+    Returns the results table (see save_forward_check).
+    """
+    function run_forward_check(jvp, J, comps, checks; tol = FORWARD_CHECK_TOL, floor = FORWARD_CHECK_FLOOR)
+        cases = check_cases(comps, checks)
+        J₀ = J()
+        @info "Forward-mode check: $(length(cases)) directions × 1 forward-mode window (forward-only J(p₀) = $(@sprintf("%.16e", J₀)))"
+
+        results = map(cases) do (label, cs, seed)
+            dirs = fd_direction(cs, seed)
+            rev = ad_directional(cs, dirs)
+            forward, J_fwd = jvp(tcomps -> seed_tangents!(tcomps, cs, dirs))
+            isfinite(forward) || error("forward-mode check: J̇ = $forward along $label (seed $seed)")
+            rel = abs(forward - rev) / max(abs(forward), abs(rev), floor * abs(J₀), eps(Float64))
+            J_rel = abs(J_fwd - J₀) / max(abs(J₀), eps(Float64))
+            @info @sprintf("    %-22s seed %10d   forward %+.15e   reverse %+.15e   rel. diff %.2e   %s",
+                           label, seed, forward, rev, rel, rel ≤ tol ? "agree" : "DISAGREE")
+            @info @sprintf("        (J of the forward-mode call %.16e, rel. diff from forward-only J %.1e)", J_fwd, J_rel)
+            (; label, seed, forward, reverse = rev, rel_diff = rel, J_forward_mode = J_fwd)
+        end
+
+        n_bad = count(r -> !(r.rel_diff ≤ tol), results)
+        worst = maximum(r -> r.rel_diff, results)
+        if n_bad == 0
+            @info @sprintf("Forward-mode check passed: forward and reverse agree in all %d directions (worst rel. diff %.2e ≤ %.0e)",
+                           length(results), worst, tol)
+        else
+            @warn @sprintf("Forward-mode check: %d of %d directions DISAGREE (rel. diff > %.0e; worst %.2e). The AD itself is suspect along them: see the table above",
+                           n_bad, length(results), tol, worst)
+        end
+        return (; tol, floor, J₀, results)
+    end
+
+    # The forward-mode check's table, with the run's config and provenance, as
+    # forward_check.jld2 in the run directory.
+    function save_forward_check(filename, fc)
+        rs = fc.results
+        jldsave(filename;
+                forward_labels   = [r.label for r in rs],
+                forward_seeds    = [r.seed for r in rs],
+                forward_jvp      = [r.forward for r in rs],       # J̇ = ∂J/∂p · v (forward mode)
+                forward_reverse  = [r.reverse for r in rs],       # ⟨∇J, v⟩ (the run's reverse shadows)
+                forward_rel_diff = [r.rel_diff for r in rs],
+                forward_J        = [r.J_forward_mode for r in rs],
+                forward_J0       = fc.J₀,                         # forward-only J(p₀)
+                forward_tol      = fc.tol,
+                forward_floor    = fc.floor,                      # rel. diff denominator ≥ floor·|J₀|
+                fd_scale_overrides = FD_SCALE_OVERRIDES,
+                config_toml      = RUN_CONFIG.toml,
                 run_provenance()...)
         return nothing
     end

@@ -81,8 +81,9 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     # x-face Nx/2 + 1. architecture: "reactant" compiles the runs (XLA) and
     # differentiates through the compiled graph; "cpu" runs plain Julia on
     # Oceananigans' CPU architecture and differentiates with Enzyme directly.
-    # biogeochemistry: "none", or "npzd" (OceanBioME's NPZD with its defaults,
-    # built by build_biogeochemistry in channel_common.jl).
+    # biogeochemistry: "none", "npzd" (OceanBioME's NPZD with its defaults), or
+    # "carbonate" (passive DIC and Alk tracers, no sources: the stage-1 carbonate
+    # chemistry test), built by build_biogeochemistry in channel_common.jl.
     function parse_model_config(d, w)
         keys_ = ("architecture", "Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi",
                  "biogeochemistry")
@@ -95,7 +96,7 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   vertical_mixing = config_choice(d, "vertical_mixing", ("catke", "scalar_surface_taper"), w),
                   fill_kappa_halos = config_value(d, "fill_kappa_halos", Bool, w),
                   gmredi = config_value(d, "gmredi", Bool, w),
-                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd"), w))
+                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd", "carbonate"), w))
     end
 
     # [run]: step counts, and where the spinup comes from (spunup_state = ""
@@ -128,25 +129,47 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     end
 
     # [checks]: the AD verification run after the model is built (ad_checks.jl).
-    #   determinism_probe    — J is a pure function of its inputs (bitwise);
-    #   fd_check             — compare the AD gradient with central finite
-    #                          differences along random directions;
-    #   fd_seed              — seeds every FD direction (reproducible);
-    #   fd_random_directions — directions over ALL perturbable inputs at once;
-    #   fd_components        — inputs to check one at a time, one direction
-    #                          each (names checked against the model's at
-    #                          startup; the log lists the available ones).
+    #   determinism_probe     — J is a pure function of its inputs (bitwise);
+    #   forward_check         — compare the reverse-mode gradient with forward-
+    #                           mode (JVP) derivatives along the directions below;
+    #   fd_check              — compare it with central finite differences along
+    #                           the same directions;
+    #   directions_seed       — seeds every direction (reproducible);
+    #   directions_random     — directions over ALL perturbable inputs at once;
+    #   directions_components — inputs to check one at a time, one direction
+    #                           each (names checked against the model's at
+    #                           startup; the log lists the available ones).
     function parse_checks_config(d, w)
-        only_config_keys(d, ("determinism_probe", "fd_check", "fd_seed", "fd_random_directions", "fd_components"), w)
+        only_config_keys(d, ("determinism_probe", "forward_check", "fd_check",
+                             "directions_seed", "directions_random", "directions_components"), w)
         checks = (; determinism_probe = config_value(d, "determinism_probe", Bool, w),
+                    forward_check = config_value(d, "forward_check", Bool, w),
                     fd_check = config_value(d, "fd_check", Bool, w),
-                    fd_seed = config_value(d, "fd_seed", Int, w),
-                    fd_random_directions = config_value(d, "fd_random_directions", Int, w; check = ≥(0), why = "must be ≥ 0"),
-                    fd_components = config_value(d, "fd_components", Vector{String}, w;
-                                                 check = allunique, why = "names must not repeat"))
-        checks.fd_check && checks.fd_random_directions == 0 && isempty(checks.fd_components) &&
-            error("$w: fd_check = true but no directions (fd_random_directions = 0 and fd_components = [])")
+                    directions_seed = config_value(d, "directions_seed", Int, w),
+                    directions_random = config_value(d, "directions_random", Int, w; check = ≥(0), why = "must be ≥ 0"),
+                    directions_components = config_value(d, "directions_components", Vector{String}, w;
+                                                         check = allunique, why = "names must not repeat"))
+        (checks.fd_check || checks.forward_check) && checks.directions_random == 0 && isempty(checks.directions_components) &&
+            error("$w: fd_check or forward_check is on but there are no directions (directions_random = 0 and directions_components = [])")
         return checks
+    end
+
+    # [objective]: which scalar J the window is differentiated for (the driver's
+    # window_objective):
+    #   "default"      — midline transport + Σ b̄² + one Σ c̄² term per non-physical
+    #                    tracer (a smooth sensitivity functional);
+    #   "surface_pco2" — the mean pCO₂ [μatm] over the wet top-layer cells at the
+    #                    end of the window, from DIC, Alk, T, S through OceanBioME's
+    #                    CarbonChemistry. Needs biogeochemistry = "carbonate".
+    const OBJECTIVES = ("default", "surface_pco2")
+
+    function parse_objective_config(d, w, model)
+        only_config_keys(d, ("name",), w)
+        objective = (; name = config_choice(d, "name", OBJECTIVES, w))
+        objective.name == "surface_pco2" && model.biogeochemistry != "carbonate" &&
+            error("$w: name = \"surface_pco2\" needs DIC and Alk: set [model] biogeochemistry = \"carbonate\" " *
+                  "(it is \"$(model.biogeochemistry)\")")
+        return objective
     end
 
     run_directory(config_path) = joinpath("runs", splitext(basename(config_path))[1]) * "/"
@@ -174,7 +197,7 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     # A parsed config from its dictionary. [kappa] exists exactly when the run
     # has GM/Redi.
     function parse_config(d, w)
-        only_config_keys(d, ("model", "run", "spice", "kappa", "checks"), w)
+        only_config_keys(d, ("model", "run", "spice", "kappa", "objective", "checks"), w)
         model = parse_model_config(config_table(d, "model", w), "$w [model]")
         kappa = if model.gmredi
             parse_kappa_config(config_table(d, "kappa", w), "$w [kappa]")
@@ -186,6 +209,7 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   run    = parse_run_config(config_table(d, "run", w), "$w [run]"),
                   spice  = parse_spice_config(config_table(d, "spice", w), "$w [spice]"),
                   kappa,
+                  objective = parse_objective_config(config_table(d, "objective", w), "$w [objective]", model),
                   checks = parse_checks_config(config_table(d, "checks", w), "$w [checks]"))
     end
 

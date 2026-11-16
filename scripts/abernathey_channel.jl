@@ -17,12 +17,13 @@
 #      inside it, e.g. κ), the forcing / BCs (ModelInputs) and the window's
 #      initial state (ModelState): Duplicated arguments, whose shadows are
 #      saved as sensitivity fields.
-#   4. Verify the gradient ([checks], ad_checks.jl): the determinism probe and
-#      the finite-difference check.
+#   4. Verify the gradient ([checks], ad_checks.jl): the determinism probe, the
+#      forward-mode check and the finite-difference check.
 #
 # Output (runs/<config name>/): data_init.jld2 (the window's initial
 # state, forcing, metadata), data_final.jld2 (the end state, J and every
-# sensitivity), fd_check.jld2 (the FD table, with [checks] fd_check), and
+# sensitivity), forward_check.jld2 (forward vs reverse mode, with [checks]
+# forward_check), fd_check.jld2 (the FD table, with [checks] fd_check), and
 # config.toml. Plot with scripts/plot_channel.jl.
 #
 #   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
@@ -67,10 +68,11 @@ const use_gmredi = RUN_CONFIG.model.gmredi
 const spunup_state_path = RUN_CONFIG.run.spunup_state
 const load_spunup_state = !isempty(spunup_state_path)
 
-# [checks]: the determinism probe and the FD gradient check (ad_checks.jl, which
-# says how to read them).
-const run_determinism_probe = RUN_CONFIG.checks.determinism_probe
-const run_fd_gradient_check = RUN_CONFIG.checks.fd_check
+# [checks]: the determinism probe, the forward-mode check and the FD gradient
+# check (ad_checks.jl, which says how to read them).
+const run_determinism_probe  = RUN_CONFIG.checks.determinism_probe
+const run_forward_mode_check = RUN_CONFIG.checks.forward_check
+const run_fd_gradient_check  = RUN_CONFIG.checks.fd_check
 
 # Horizontal resolution ([model] Nx, Ny). Nz (vertical resolution) is a
 # campaign-wide constant in channel_common.jl.
@@ -100,7 +102,12 @@ spinup_reentrant_channel_model!(model, inputs, state, Nspinup) =
 run_reentrant_channel_model!(model, inputs, state, Ntimesteps) =
     run_window!(model, inputs, state, Ntimesteps, FixedKappa())
 
-# OBJECTIVE: midline zonal transport PLUS a stratification term PLUS a
+# THE OBJECTIVE ([objective] name): estimate_tracer_error runs the window and
+# returns window_objective(OBJECTIVE, ...), resolved while tracing, so each
+# compiled graph holds exactly one objective. Each method below says what it is.
+const OBJECTIVE = Val(Symbol(RUN_CONFIG.objective.name))
+
+# "default": midline zonal transport PLUS a stratification term PLUS a
 # biogeochemical-tracer term.
 #
 #   J = J_transport + w_strat · J_strat [+ w_tracers · J_tracers]
@@ -131,7 +138,10 @@ other_tracer_names(model) = filter(n -> !(n in (:T, :S, :e)), keys(model.tracers
 
 function estimate_tracer_error(model, inputs, state, x_midpoint, Ntimesteps)
     run_reentrant_channel_model!(model, inputs, state, Ntimesteps)
+    return window_objective(OBJECTIVE, model, inputs, x_midpoint)
+end
 
+function window_objective(::Val{:default}, model, inputs, x_midpoint)
     Nx, Ny, Nz = size(model.grid)
 
     # Fields are read through interior(...), never by range-indexing the Field:
@@ -168,6 +178,24 @@ function estimate_tracer_error(model, inputs, state, x_midpoint, Ntimesteps)
     return J
 end
 
+# "surface_pco2" (stage 1 of the OceanBioME roadmap): the mean pCO₂ [μatm] over
+# the wet top-layer cells at the end of the window, from DIC, Alk, T and S
+# through OceanBioME's CarbonChemistry (surface_pCO₂!, channel_common.jl), so
+# ∂J/∂(initial DIC, Alk, T, S, flow, forcing) runs through the H⁺ solve. The
+# pCO₂ is written into the model's auxiliary field (objective_auxiliary_fields),
+# zero on dry cells; the wet count is a constant of the grid (n_wet_surface).
+# The grid is uniform in x and y, so the plain mean is the area mean.
+function window_objective(::Val{:surface_pco2}, model, inputs, x_midpoint)
+    pCO₂ = model.auxiliary_fields.pCO₂
+    surface_pCO₂!(pCO₂, model)
+    return sum(interior(pCO₂)) / n_wet_surface
+end
+
+# The diagnostic Fields an objective writes inside the compiled window, handed to
+# build_model as auxiliary_fields (so they are part of the model and its shadow).
+objective_auxiliary_fields(::Val{:default}, grid) = NamedTuple()
+objective_auxiliary_fields(::Val{:surface_pco2}, grid) = (; pCO₂ = Field{Center, Center, Nothing}(grid))
+
 function differentiate_tracer_error(model, inputs, state, dmodel, dinputs, dstate, x_midpoint, Ntimesteps)
 
     dedν = autodiff(set_strong_zero(Enzyme.ReverseWithPrimal),
@@ -178,6 +206,20 @@ function differentiate_tracer_error(model, inputs, state, dmodel, dinputs, dstat
                     Const(x_midpoint), Const(Ntimesteps))
 
     return dedν
+end
+
+# FORWARD MODE (the forward-mode check, ad_checks.jl): the same arguments as
+# differentiate_tracer_error, keep them in lockstep. The shadows are TANGENTS
+# here: seeded with a direction v on the inputs (tstate, tinputs, tmodel's κ
+# fields), they return J̇ = ∂J/∂p · v. Returns (J̇, J), derivative first.
+function jvp_tracer_error(model, inputs, state, tmodel, tinputs, tstate, x_midpoint, Ntimesteps)
+
+    return autodiff(set_strong_zero(Enzyme.ForwardWithPrimal),
+                    estimate_tracer_error, Duplicated,
+                    Duplicated(model, tmodel),
+                    Duplicated(inputs, tinputs),
+                    Duplicated(state, tstate),
+                    Const(x_midpoint), Const(Ntimesteps))
 end
 
 #####
@@ -203,7 +245,8 @@ grid = make_grid(architecture, Nx, Ny, Nz, z_faces)
 # compiled graph, so they get no gradient (ad_checks.jl).
 biogeochemistry = build_biogeochemistry(grid)
 
-model         = build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = use_gmredi, biogeochemistry)
+model         = build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = use_gmredi, biogeochemistry,
+                            auxiliary_fields = objective_auxiliary_fields(OBJECTIVE, grid))
 set_biogeochemical_initial_conditions!(model)
 T_flux        = T_flux_init(model.grid, parameters)
 u_wind_stress = u_wind_stress_init(model.grid, parameters)
@@ -212,6 +255,26 @@ Tᵢ, Sᵢ        = temperature_salinity_init(model.grid, parameters)
 Δzᶜ            = on_architecture(architecture, Δz) #zspacings(model.grid, Center()))
 
 report_biogeochemical_state(model)
+
+# The number of wet top-layer cells (the surface_pco2 objective's mean), from
+# the same wet mask the AD checks use; a constant of the grid, baked into the
+# compiled graph. check_surface_pCO₂_mask verifies it against the kernel's own
+# dry test after the first evaluation.
+const n_wet_surface = count(fd_wet_masks(model).c[:, :, Nz])
+@info "Objective: $(RUN_CONFIG.objective.name)" * (OBJECTIVE isa Val{:surface_pco2} ? " (mean over $n_wet_surface wet surface cells)" : "")
+
+# The surface_pco2 objective's mean must be over the cells the kernel computed:
+# its nonzero entries must be exactly the wet mask's top layer.
+check_surface_pCO₂_mask(::Val, model) = nothing
+function check_surface_pCO₂_mask(::Val{:surface_pco2}, model)
+    p = to_host(model.auxiliary_fields.pCO₂)[:, :, 1]
+    wet = fd_wet_masks(model).c[:, :, Nz]
+    (p .!= 0) == wet ||
+        error("surface pCO₂: the kernel's wet cells ($(count(!=(0), p))) differ from the wet mask's ($(count(wet)))")
+    @info @sprintf("Surface pCO₂ at the end of the window: %.2f to %.2f μatm (mean %.4f) over %d wet cells",
+                   minimum(p[wet]), maximum(p[wet]), sum(p[wet]) / count(wet), count(wet))
+    return nothing
+end
 
 # Fixed experiment configuration (never mutated after this point):
 model_inputs  = ModelInputs(u_wind_stress, v_wind_stress, T_flux, Δzᶜ)
@@ -240,11 +303,11 @@ capture_closure_state!(initial_state, model)   # the freshly built model's closu
 dmodel, dmodel_inputs = Enzyme.make_zero((model, model_inputs))
 dspunup_state         = Enzyme.make_zero(spunup_state)
 
-# The inputs the AD checks can perturb, and the [checks] fd_components names
-# validated against them now, before the compile.
+# The inputs the AD checks can perturb, and the [checks] directions_components
+# names validated against them now, before the compile.
 fd_inputs = fd_components(model, model_inputs, spunup_state, dmodel, dmodel_inputs, dspunup_state)
-@info "Inputs the FD check can perturb ([checks] fd_components): $(join([c.name for c in fd_inputs], ", "))"
-run_fd_gradient_check && select_fd_components(fd_inputs, RUN_CONFIG.checks.fd_components)
+@info "Inputs the FD and forward-mode checks can perturb ([checks] directions_components): $(join([c.name for c in fd_inputs], ", "))"
+(run_fd_gradient_check || run_forward_mode_check) && select_fd_components(fd_inputs, RUN_CONFIG.checks.directions_components)
 
 # WINDOW IC FROM FILE, checked (validate_window_ic, window_ic_checks.jl: the source's
 # config, the steps it has run, the code constants) and loaded BEFORE @compile, so
@@ -274,11 +337,19 @@ if use_reactant
     restimate_tracer_error = @compile raise_first=true raise=true sync=true estimate_tracer_error(model, model_inputs, spunup_state, x_midpoint, Ntimesteps)
     rdifferentiate_tracer_error = @compile raise_first=true raise=true sync=true  differentiate_tracer_error(model, model_inputs, spunup_state,
                                                                                                              dmodel, dmodel_inputs, dspunup_state, x_midpoint, Ntimesteps)
+    # The forward-mode function only when the forward-mode check will run (one
+    # more compile). The run's shadows serve as the tangents' shapes and types;
+    # @compile does not run it, so they stay zero.
+    if run_forward_mode_check
+        rjvp_tracer_error = @compile raise_first=true raise=true sync=true  jvp_tracer_error(model, model_inputs, spunup_state,
+                                                                                             dmodel, dmodel_inputs, dspunup_state, x_midpoint, Ntimesteps)
+    end
 else
     @info "CPU architecture: no @compile; the functions are called directly."
     rspinup_reentrant_channel_model! = spinup_reentrant_channel_model!
     restimate_tracer_error           = estimate_tracer_error
     rdifferentiate_tracer_error      = differentiate_tracer_error
+    rjvp_tracer_error                = jvp_tracer_error
 end
 compile_toc = time() - tic
 
@@ -357,6 +428,10 @@ dedν = rdifferentiate_tracer_error(model, model_inputs, spunup_state,
 
 @show dedν
 
+# The model now holds the end of the window, including the objective's
+# diagnostic fields: for surface_pco2, check the mean was over the right cells.
+check_surface_pCO₂_mask(OBJECTIVE, model)
+
 # NaN derivatives on dry (immersed) entries — CPU Enzyme gives them in the
 # velocity shadows' wall entries — are set to 0 here, before anything saves or
 # reads the shadows; a NaN on a wet entry is an error. See the DISCLAIMER in
@@ -376,6 +451,28 @@ filename = graph_directory * "data_final.jld2"
 save_final!(filename, model, dmodel, dmodel_inputs, dspunup_state, dedν;
             extra = merge(use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata,
                           (; dry_nans_zeroed = dry_nan_report)))
+
+# One forward-mode call at the current inputs with FRESH tangent shadows (the
+# run's reverse shadows stay as saved), seeded by `seed!` on the components
+# built on them. Returns (J̇, J).
+function evaluate_jvp(seed!)
+    tm, ti = Enzyme.make_zero((model, model_inputs))   # one call, as for dmodel: mirrors the aliasing
+    ts     = Enzyme.make_zero(spunup_state)
+    seed!(fd_components(model, model_inputs, spunup_state, tm, ti, ts))
+    out = rjvp_tracer_error(model, model_inputs, spunup_state, tm, ti, ts, x_midpoint, Ntimesteps)
+    return convert(Float64, out[1]), convert(Float64, out[2])
+end
+
+# FORWARD-MODE CHECK of the gradient just saved (ad_checks.jl), along the FD
+# check's directions; before the FD check, which costs ~10× more per direction.
+# After save_final!: its windows move the model, never the saved files' content.
+if run_forward_mode_check
+    tic = time()
+    forward_results = run_forward_check(evaluate_jvp, evaluate_J, fd_inputs, RUN_CONFIG.checks)
+    save_forward_check(graph_directory * "forward_check.jld2", forward_results)
+    forward_toc = time() - tic
+    @show forward_toc
+end
 
 # FD CHECK of the gradient just saved (ad_checks.jl). After save_final!: its
 # evaluations move the model, never the saved files' content.

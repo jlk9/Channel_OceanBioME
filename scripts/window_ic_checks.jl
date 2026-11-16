@@ -84,7 +84,8 @@ if !@isdefined(_WINDOW_IC_CHECKS_LOADED)
     # Configs saved by older versions of this code, normalized so those runs can
     # still serve as a window IC source: before the `kind` key was dropped they
     # carry kind = "truth" (ignored); before [model] architecture existed every
-    # run was on Reactant; before [model] biogeochemistry existed none had any.
+    # run was on Reactant; before [model] biogeochemistry existed none had any;
+    # [checks] keys were renamed and [objective] added on 2026-11-15 (below).
     function saved_sections(d, w)
         d = copy(d)
         get(d, "kind", nothing) == "truth" && delete!(d, "kind")
@@ -95,6 +96,21 @@ if !@isdefined(_WINDOW_IC_CHECKS_LOADED)
             haskey(model, "biogeochemistry") || (model["biogeochemistry"] = "none")
             d["model"] = model
         end
+        # Before the forward-mode check (2026-11-15), [checks] had no
+        # forward_check and named its directions fd_seed, fd_random_directions,
+        # fd_components. [checks] is not compared; this only lets it parse.
+        checks = get(d, "checks", nothing)
+        if checks isa AbstractDict && !haskey(checks, "forward_check")
+            checks = copy(checks)
+            checks["forward_check"] = false
+            for (old, new) in ("fd_seed" => "directions_seed", "fd_random_directions" => "directions_random",
+                               "fd_components" => "directions_components")
+                haskey(checks, old) && (checks[new] = pop!(checks, old))
+            end
+            d["checks"] = checks
+        end
+        # Before [objective] (2026-11-15) every run used the default objective.
+        haskey(d, "objective") || (d["objective"] = Dict("name" => "default"))
         t = parse_config(d, w)
         return (; t.model, run = (; t.run.Nspinup, t.run.Ntimesteps), t.kappa, t.spice)
     end

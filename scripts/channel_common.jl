@@ -42,6 +42,8 @@ using Oceananigans.Grids: xnode, ynode, znode
 using Oceananigans.TurbulenceClosures: CATKEVerticalDiffusivity, HorizontalFormulation, IsopycnalSkewSymmetricDiffusivity
 using Oceananigans.TimeSteppers: update_state!
 using Oceananigans.BoundaryConditions: fill_halo_regions!
+using Oceananigans.Utils: launch!
+using Oceananigans.Utils.KernelAbstractions: @kernel, @index   # Oceananigans' own KernelAbstractions
 
 using SeawaterPolynomials
 
@@ -92,7 +94,7 @@ include(joinpath(@__DIR__, "channel_geometry.jl"))
 const use_reactant = RUN_CONFIG.model.architecture == "reactant"
 use_reactant && @info "To specify the Reactant backend uncomment line 'Reactant.set_default_backend(\"cpu\")' in channel_common.jl"
 
-# The biogeochemistry ([model] biogeochemistry): "none" or "npzd". Built by
+# The biogeochemistry ([model] biogeochemistry): "none", "npzd" or "carbonate". Built by
 # build_biogeochemistry, its initial conditions set by
 # set_biogeochemical_initial_conditions! (see "Biogeochemistry" below).
 const biogeochemistry_choice = RUN_CONFIG.model.biogeochemistry
@@ -214,6 +216,16 @@ parameters = (
 
 using Oceananigans.TurbulenceClosures.TKEBasedVerticalDiffusivities: CATKEMixingLength, CATKEEquation
 
+# WORKAROUND, Oceananigans 0.117.2: abstract_scalar_diffusivity_closure.jl
+# defines the Array/Field diffusivity accessors at every location EXCEPT κᶜᶜᶜ
+# (its ν counterparts exist), so ISSD with Field κ (ϵκR₃₃ calls κᶜᶜᶜ) throws a
+# MethodError while building the model. The two missing methods, written like
+# their ν twins. Delete once Oceananigans defines them.
+@inline Oceananigans.TurbulenceClosures.κᶜᶜᶜ(i, j, k, grid, ::Tuple{Center, Center, Center}, κ::AbstractArray, clk, fields) =
+    @inbounds κ[i, j, k]
+@inline Oceananigans.TurbulenceClosures.κᶜᶜᶜ(i, j, k, grid, ::Tuple{Center, Center, Face}, κ::AbstractArray, clk, fields) =
+    Oceananigans.Operators.ℑzᵃᵃᶜ(i, j, k, grid, κ)
+
 # The vertical-mixing configuration as recorded in save files. (Files written
 # before 2026-10-07, which lack the key, ran the scalar closure with κz_add
 # tapered from the BOTTOM, a bug fixed then.)
@@ -307,7 +319,8 @@ end
 # and forcing come with it. What ModelState does NOT carry is any other state
 # it keeps from step to step (e.g. sediment fields): see
 # report_biogeochemical_state.
-function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeochemistry = nothing)
+function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeochemistry = nothing,
+                     auxiliary_fields = NamedTuple())
 
     temperature_flux_bc = FluxBoundaryCondition(Field{Center, Center, Nothing}(grid))
 
@@ -419,11 +432,12 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
     # Smooth, fully-Float64 advection for gradient verification; WENO for production.
     advection = use_smooth_advection ? Centered(order=2) : WENO(order=3)
 
-    # Tracer advection: `advection` for T and S (and CATKE's e); first-order
-    # upwind for a biogeochemistry's tracers (biogeochemical_tracer_advection).
+    # Tracer advection: `advection` for T and S (and CATKE's e); for a
+    # biogeochemistry's tracers, biogeochemical_tracer_advection (first-order
+    # upwind for NPZD, `advection` itself for the passive carbonate tracers).
     tracer_advection = biogeochemistry === nothing ? advection :
         merge(NamedTuple{model_tracer_names(biogeochemistry)}(
-                  map(n -> n in (:T, :S) ? advection : biogeochemical_tracer_advection(),
+                  map(n -> n in (:T, :S) ? advection : biogeochemical_tracer_advection(advection),
                       model_tracer_names(biogeochemistry))),
               use_catke ? (; e = advection) : (;))
 
@@ -444,6 +458,11 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
         # biogeochemistry's tracers are declared here (model_tracer_names).
         tracers = model_tracer_names(biogeochemistry),
         biogeochemistry = biogeochemistry,
+        # Diagnostic fields an objective writes inside the compiled window (e.g.
+        # the surface pCO₂, objective_auxiliary_fields): part of the model, so
+        # they are arguments of the compiled functions, with shadows. Not state:
+        # each is fully rewritten before it is read.
+        auxiliary_fields = auxiliary_fields,
         boundary_conditions = (T = T_bcs, u = u_bcs, v = v_bcs),
         forcing = forcing
     )
@@ -466,13 +485,25 @@ model_tracer_names(bgc) =
     (:T, :S, filter(n -> !(n in (:T, :S)),
                     Oceananigans.Biogeochemistry.required_biogeochemical_tracers(bgc))...)
 
+# PASSIVE CARBONATE TRACERS ("carbonate"): dissolved inorganic carbon (DIC,
+# mmol C/m³) and total alkalinity (Alk, meq/m³), advected and mixed like any
+# tracer, with NO sources or sinks: the continuous-form default tendency is
+# zero. The stage-1 carbonate test: the chemistry acts only in the objective
+# (surface pCO₂, surface_pCO₂!), not on the flow. No air–sea CO₂ flux (stage 2).
+# OceanBioME's own CarbonateSystem is not used: it is a component of
+# NutrientsPlanktonDetritus, coupled to production and remineralisation.
+struct PassiveCarbonateTracers <: Oceananigans.Biogeochemistry.AbstractContinuousFormBiogeochemistry end
+Oceananigans.Biogeochemistry.required_biogeochemical_tracers(::PassiveCarbonateTracers) = (:DIC, :Alk)
+
 # The biogeochemistry for `grid`, or `nothing`. "npzd": OceanBioME's NPZD with
 # all its defaults (Kuhn et al. 2015 parameters; two-band light under a constant
 # surface PAR of 100 W/m², so no clock dependence; detritus sinking out of an
 # open bottom; no sediment, no negative-tracer modifiers). Its parameters are
 # plain numbers, baked into a compiled graph: no gradient, no FD perturbation.
+# "carbonate": PassiveCarbonateTracers.
 build_biogeochemistry(grid) =
-    biogeochemistry_choice == "npzd" ? OceanBioME.NPZD(grid) : nothing
+    biogeochemistry_choice == "npzd"      ? OceanBioME.NPZD(grid) :
+    biogeochemistry_choice == "carbonate" ? PassiveCarbonateTracers() : nothing
 
 # NPZD initial conditions [mmol N/m³], functions of depth only, smooth and
 # STRICTLY POSITIVE: the two-band light model raises chlorophyll (from P) to a
@@ -497,8 +528,14 @@ const npzd_initial_conditions = (; N_surface = 2.0,  N_deep = 15.0, h_N = 300.0,
 # indicators, unlike WENO), so it puts no noise floor on J. It is linear in the
 # tracer but switches stencil on the SIGN of the velocity: J is continuous
 # there, with a kink where a face velocity crosses zero.
-biogeochemical_tracer_advection() = UpwindBiased(order = 1)
-biogeochemical_tracer_advection_name() = biogeochemistry_choice == "none" ? "" : "UpwindBiased(order=1)"
+# The passive carbonate tracers have no fractional powers and stay near 2000
+# over any window here, so they take `advection` (the [model] choice, centered
+# for any FD comparison) and keep J smooth.
+biogeochemical_tracer_advection(advection) =
+    biogeochemistry_choice == "carbonate" ? advection : UpwindBiased(order = 1)
+biogeochemical_tracer_advection_name() =
+    biogeochemistry_choice == "none"      ? "" :
+    biogeochemistry_choice == "carbonate" ? "[model] advection" : "UpwindBiased(order=1)"
 
 # Set the biogeochemical tracers' initial values on `model`, right after
 # build_model (the driver then copies them into the analytic initial state).
@@ -515,7 +552,98 @@ function set_biogeochemical_initial_conditions!(model, ::Val{:npzd})
     return nothing
 end
 
-biogeochemistry_initial_conditions() = biogeochemistry_choice == "npzd" ? sprint(show, npzd_initial_conditions) : ""
+# Carbonate initial conditions, depth only, smooth: DIC [mmol C/m³] and Alk
+# [meq/m³] rising from a surface value to a deep one over the e-folding depth h.
+# Chosen so the surface pCO₂ is a plausible few hundred μatm at the channel's
+# surface temperatures (S = 35). Saved and checked as a code constant.
+const carbonate_initial_conditions = (; DIC_surface = 2100.0, DIC_deep = 2250.0, h_DIC = 500.0,
+                                        Alk_surface = 2300.0, Alk_deep = 2380.0, h_Alk = 500.0)
+
+function set_biogeochemical_initial_conditions!(model, ::Val{:carbonate})
+    c = carbonate_initial_conditions
+    DICᵢ(x, y, z) = c.DIC_deep + (c.DIC_surface - c.DIC_deep) * exp(z / c.h_DIC)
+    Alkᵢ(x, y, z) = c.Alk_deep + (c.Alk_surface - c.Alk_deep) * exp(z / c.h_Alk)
+    @allowscalar set!(model, DIC = DICᵢ, Alk = Alkᵢ)
+    return nothing
+end
+
+biogeochemistry_initial_conditions() =
+    biogeochemistry_choice == "npzd"      ? sprint(show, npzd_initial_conditions) :
+    biogeochemistry_choice == "carbonate" ? sprint(show, carbonate_initial_conditions) : ""
+
+#####
+##### Carbonate chemistry: surface pCO₂ (objective "surface_pco2")
+#####
+# THE H⁺ SOLVER. OceanBioME's default (DampedNewtonRaphsonSolver) iterates
+# `while |residual| > atol` with an inner Armijo `while`: data-dependent loops,
+# which Reactant cannot raise to StableHLO inside a kernel ("cannot raise op to
+# stablehlo" on the scf.while, 2026-11-15; NPZD's PAR loop raises because its
+# trip count is bounded by Nz). So: plain Newton with a FIXED number of
+# iterations N, a type parameter, so the loop has static bounds. A fixed count
+# also keeps J free of jumps where an iteration count would change. A step that
+# would make H⁺ ≤ 0 halves H⁺ instead (never taken in the tests below).
+# Tested on CPU (2026-11-15) from pH 8 over DIC 1900–2400, Alk 2200–2450,
+# T −2…20 °C, S 33–37: N = 8 → 5e-6, N = 10 → 7e-15 max relative difference in
+# pCO₂ from the default solver; and Enzyme's forward and reverse derivatives
+# through N = 20 iterations agree with central FD of the DEFAULT solver (FD
+# error falling as h² to 3e-10 for ∂/∂DIC; 1e-10 for ∂/∂T). N = 20: twice the
+# iterations needed. The default's own count is data-dependent: DIC 2100, Alk
+# 2300, T 6 hits a residual of exactly 0 after 5 iterations; DIC 2250, Alk 2380,
+# T 0 stalls at |residual| = 4.3e-19 (round-off, above atol = 1e-20) after 4 and
+# runs to max_iters = 100, each extra iteration backtracking 10 times to
+# λ ≈ 1e-3 (960 halvings).
+struct FixedNewtonSolver{N} end
+
+@inline function (::FixedNewtonSolver{N})(f, f′, x₀, params) where N
+    x = x₀
+    for _ in 1:N
+        δ = f(x, params) / f′(x, params)
+        x = ifelse(x - δ > 0, x - δ, x / 2)
+    end
+    return x
+end
+
+const carbon_chemistry_newton_iterations = 20
+
+# OceanBioME's CarbonChemistry with its defaults (Lueker K1/K2, TEOS-10
+# polynomial density, …) EXCEPT the H⁺ solver (FixedNewtonSolver above). Its
+# parameters are plain numbers inside an isbits struct: baked into the
+# compiled graph (no gradient w.r.t. them).
+const carbon_chemistry = OceanBioME.CarbonChemistry(solver = FixedNewtonSolver{carbon_chemistry_newton_iterations}())
+carbon_chemistry_details() = biogeochemistry_choice == "carbonate" ?
+    "OceanBioME.CarbonChemistry() defaults, solver = FixedNewtonSolver{$carbon_chemistry_newton_iterations} (from pH 8)" : ""
+
+# The H⁺ solve cannot run in a traced broadcast (OceanBioME's default solver's
+# `while` needs a traced Bool's value at trace time), so pCO₂ is computed by
+# this kernel into a 2-D Field, at the top cell of each column (k = Nz). Inside
+# a kernel, the default solver's `while` still fails to raise to StableHLO:
+# hence FixedNewtonSolver above (docs/oceanbiome_hplus_solver_reactant.md). Dry cells
+# (the wall) hold zero tracers, for which the solve is meaningless: they get
+# fixed in-range values through ifelse, so no NaN is formed (on either AD
+# pass), and write 0.
+@kernel function _surface_pCO₂!(pCO₂, grid, cc, DIC, Alk, T, S)
+    i, j = @index(Global, NTuple)
+    k = size(grid, 3)
+    @inbounds begin
+        dry = Oceananigans.Grids.inactive_cell(i, j, k, grid)
+        d = ifelse(dry, 2000.0, DIC[i, j, k])
+        a = ifelse(dry, 2300.0, Alk[i, j, k])
+        t = ifelse(dry, 10.0, T[i, j, k])
+        s = ifelse(dry, 35.0, S[i, j, k])
+        p = cc(; DIC = d, Alk = a, T = t, S = s, output = Val(:pCO₂))
+        pCO₂[i, j, 1] = ifelse(dry, zero(p), p)
+    end
+end
+
+# Surface pCO₂ [μatm] of `model`'s current state into the 2-D Field `pCO₂`
+# (zero on dry cells). Called inside the compiled window.
+function surface_pCO₂!(pCO₂, model)
+    grid = model.grid
+    tr = model.tracers
+    launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _surface_pCO₂!,
+            pCO₂, grid, carbon_chemistry, tr.DIC, tr.Alk, tr.T, tr.S)
+    return nothing
+end
 
 #####
 ##### Closure accessors: find a closure by TYPE, not by tuple position
@@ -1454,6 +1582,7 @@ code_constants() = (; coriolis_f              = f,
                       vertical_mixing_details = vertical_mixing_details(),   # CATKE's parameters ("" without)
                       biogeochemistry_initial_conditions = biogeochemistry_initial_conditions(),  # "" without
                       biogeochemical_tracer_advection    = biogeochemical_tracer_advection_name(), # "" without
+                      carbon_chemistry                   = carbon_chemistry_details(),              # "" without
                       forcing_parameters      = parameters)
 
 # Metadata common to init and final files: the code-level constants, a few

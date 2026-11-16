@@ -6,7 +6,7 @@
 #
 # The channel with constant-κ GM/Redi and scalar vertical mixing, spice
 # off, spun up for a month; then a 1-day window, its AD gradient, the
-# determinism probe and the FD check of every input (ad_checks.jl).
+# determinism probe, the forward-mode check and the FD check of every input (ad_checks.jl).
 
 [model]
 architecture = "cpu"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
@@ -32,13 +32,17 @@ L = 250e3                        # m, Gaussian width (meridional)
 z = -800.0                       # m, centre (vertical)
 H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
 
+[objective]                      # the scalar J ("default" or "surface_pco2"; run_config.jl)
+name = "default"
+
 [checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
 determinism_probe = true         # J bitwise reproducible after an AD call at other inputs (~1 AD + 2 forward calls)
+forward_check = true             # forward-mode (JVP) vs reverse-mode directional derivatives (1 forward-mode window per direction)
 fd_check = true                  # FD vs AD directional derivatives (2 forward windows per ε per direction)
-fd_seed = 2026                   # seeds every FD direction
-fd_random_directions = 2         # directions over all inputs at once
+directions_seed = 2026           # seeds every direction (forward-mode and FD checks)
+directions_random = 2            # directions over all inputs at once
 # One direction per input listed (the log lists the model's inputs; biogeochemical
 # tracers appear under their names):
-fd_components = ["T", "S", "u", "v",
-                 "u_wind_stress", "v_wind_stress", "temp_flux",
-                 "kappa_z"]
+directions_components = ["T", "S", "u", "v",
+                         "u_wind_stress", "v_wind_stress", "temp_flux",
+                         "kappa_z"]
