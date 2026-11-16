@@ -94,6 +94,8 @@ if !@isdefined(_WINDOW_IC_CHECKS_LOADED)
             model = copy(model)
             haskey(model, "architecture")    || (model["architecture"] = "reactant")
             haskey(model, "biogeochemistry") || (model["biogeochemistry"] = "none")
+            # [model] co2_gas_exchange arrived with stage 2 (2026-11-15).
+            haskey(model, "co2_gas_exchange") || (model["co2_gas_exchange"] = false)
             d["model"] = model
         end
         # Before the forward-mode check (2026-11-15), [checks] had no

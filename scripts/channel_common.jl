@@ -99,6 +99,10 @@ use_reactant && @info "To specify the Reactant backend uncomment line 'Reactant.
 # set_biogeochemical_initial_conditions! (see "Biogeochemistry" below).
 const biogeochemistry_choice = RUN_CONFIG.model.biogeochemistry
 
+# The air–sea CO₂ flux on DIC's top boundary ([model] co2_gas_exchange; see
+# co2_exchange_boundary_condition below).
+const co2_gas_exchange = RUN_CONFIG.model.co2_gas_exchange
+
 # Salinity and the density-compensated spice anomaly S′(y, z) ([spice]): see
 # spice_anomaly for the design. They enter `parameters` below (saved as
 # forcing_parameters).
@@ -463,7 +467,9 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
         # they are arguments of the compiled functions, with shadows. Not state:
         # each is fully rewritten before it is read.
         auxiliary_fields = auxiliary_fields,
-        boundary_conditions = (T = T_bcs, u = u_bcs, v = v_bcs),
+        boundary_conditions = co2_gas_exchange ?
+            (T = T_bcs, u = u_bcs, v = v_bcs, DIC = FieldBoundaryConditions(top = co2_exchange_boundary_condition())) :
+            (T = T_bcs, u = u_bcs, v = v_bcs),
         forcing = forcing
     )
 
@@ -489,7 +495,9 @@ model_tracer_names(bgc) =
 # mmol C/m³) and total alkalinity (Alk, meq/m³), advected and mixed like any
 # tracer, with NO sources or sinks: the continuous-form default tendency is
 # zero. The stage-1 carbonate test: the chemistry acts only in the objective
-# (surface pCO₂, surface_pCO₂!), not on the flow. No air–sea CO₂ flux (stage 2).
+# (surface pCO₂, surface_pCO₂!), not on the flow. With [model] co2_gas_exchange
+# (stage 2) DIC also has an air–sea flux through its top boundary
+# (co2_exchange_boundary_condition), so it is no longer conserved.
 # OceanBioME's own CarbonateSystem is not used: it is a component of
 # NutrientsPlanktonDetritus, coupled to production and remineralisation.
 struct PassiveCarbonateTracers <: Oceananigans.Biogeochemistry.AbstractContinuousFormBiogeochemistry end
@@ -642,6 +650,61 @@ function surface_pCO₂!(pCO₂, model)
     tr = model.tracers
     launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _surface_pCO₂!,
             pCO₂, grid, carbon_chemistry, tr.DIC, tr.Alk, tr.T, tr.S)
+    return nothing
+end
+
+#####
+##### Air–sea CO₂ exchange (stage 2; [model] co2_gas_exchange, objective "co2_uptake")
+#####
+# OceanBioME's CarbonDioxideGasExchangeBoundaryCondition on DIC's top boundary:
+# a flux F = k(u₁₀, T) · ([CO₂(aq)] − [CO₂]_air) [mmol C m⁻² s⁻¹, upward = out
+# of the ocean positive], evaluated in every surface column at every step.
+#   * [CO₂(aq)] from DIC, Alk, T, S through `carbon_chemistry` (above). Passing
+#     it is REQUIRED: the constructor's default is CarbonChemistry(), whose
+#     damped Newton solver does not compile under Reactant
+#     (docs/oceanbiome_hplus_solver_reactant.md).
+#   * [CO₂]_air: a dry-air mole fraction co2_air_mole_fraction at 1 atm,
+#     through the Weiss–Price solubility with the same chemistry's density.
+#   * k: Ho et al. (2006) k₆₆₀ = 0.266 cm/h · u₁₀², Schmidt-number scaled
+#     (OceanBioME's defaults), at a constant u₁₀ = co2_exchange_wind_speed,
+#     about the 10-m wind of the channel's 0.2 N/m² peak westerly stress.
+# All plain numbers: baked into the compiled graph (no gradient w.r.t. them).
+# Dry (wall) columns: the flux is evaluated on their zero tracers (finite, with
+# finite Enzyme derivatives, tested on CPU 2026-11-15) and acts on cells that
+# are not wet; the objective excludes them.
+const co2_exchange_wind_speed = 10.0   # u₁₀ [m/s]
+const co2_air_mole_fraction   = 413.0  # xCO₂ [ppmv]
+
+co2_exchange_boundary_condition() =
+    OceanBioME.CarbonDioxideGasExchangeBoundaryCondition(; carbon_chemistry,
+                                                          wind_speed = co2_exchange_wind_speed,
+                                                          air_concentration = co2_air_mole_fraction)
+
+co2_gas_exchange_details() = co2_gas_exchange ?
+    "OceanBioME.CarbonDioxideGasExchangeBoundaryCondition on DIC (top): carbon_chemistry as above, " *
+    "u10 = $co2_exchange_wind_speed m/s, xCO2 = $co2_air_mole_fraction ppmv, other defaults (Ho06, Schmidt scaling, Weiss-Price)" : ""
+
+# The air→sea CO₂ flux [mmol C m⁻² day⁻¹, positive INTO the ocean] in each
+# surface column of `model`'s current state, into the 2-D Field `uptake`
+# (zero on dry cells), by calling the boundary condition's own function: the
+# flux the model applies to DIC, sign-flipped and per day. Called inside the
+# compiled window.
+@kernel function _surface_CO₂_uptake!(uptake, grid, exchange, clock, fields)
+    i, j = @index(Global, NTuple)
+    k = size(grid, 3)
+    @inbounds begin
+        dry = Oceananigans.Grids.inactive_cell(i, j, k, grid)
+        F = exchange(i, j, grid, clock, fields)
+        uptake[i, j, 1] = ifelse(dry, zero(F), -F * 86400)
+    end
+end
+
+function surface_CO₂_uptake!(uptake, model)
+    grid = model.grid
+    tr = model.tracers
+    exchange = tr.DIC.boundary_conditions.top.condition.func   # OceanBioME's GasExchange
+    launch!(Oceananigans.Architectures.architecture(grid), grid, :xy, _surface_CO₂_uptake!,
+            uptake, grid, exchange, model.clock, (; tr.T, tr.S, tr.DIC, tr.Alk))
     return nothing
 end
 
@@ -1583,6 +1646,7 @@ code_constants() = (; coriolis_f              = f,
                       biogeochemistry_initial_conditions = biogeochemistry_initial_conditions(),  # "" without
                       biogeochemical_tracer_advection    = biogeochemical_tracer_advection_name(), # "" without
                       carbon_chemistry                   = carbon_chemistry_details(),              # "" without
+                      co2_exchange                       = co2_gas_exchange_details(),              # "" without
                       forcing_parameters      = parameters)
 
 # Metadata common to init and final files: the code-level constants, a few

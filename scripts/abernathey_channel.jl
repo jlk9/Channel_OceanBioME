@@ -191,10 +191,24 @@ function window_objective(::Val{:surface_pco2}, model, inputs, x_midpoint)
     return sum(interior(pCO₂)) / n_wet_surface
 end
 
+# "co2_uptake" (stage 2): the mean air→sea CO₂ flux [mmol C m⁻² day⁻¹,
+# positive into the ocean] over the wet top-layer cells at the end of the
+# window. It is the flux DIC's gas-exchange boundary condition applies
+# (surface_CO₂_uptake!, channel_common.jl, calls that condition's own
+# function), from the surface DIC, Alk, T, S through the H⁺ solve; during the
+# window the same flux has been changing DIC. Written into an auxiliary field
+# like pCO₂, zero on dry cells.
+function window_objective(::Val{:co2_uptake}, model, inputs, x_midpoint)
+    uptake = model.auxiliary_fields.CO₂_uptake
+    surface_CO₂_uptake!(uptake, model)
+    return sum(interior(uptake)) / n_wet_surface
+end
+
 # The diagnostic Fields an objective writes inside the compiled window, handed to
 # build_model as auxiliary_fields (so they are part of the model and its shadow).
 objective_auxiliary_fields(::Val{:default}, grid) = NamedTuple()
 objective_auxiliary_fields(::Val{:surface_pco2}, grid) = (; pCO₂ = Field{Center, Center, Nothing}(grid))
+objective_auxiliary_fields(::Val{:co2_uptake}, grid) = (; CO₂_uptake = Field{Center, Center, Nothing}(grid))
 
 function differentiate_tracer_error(model, inputs, state, dmodel, dinputs, dstate, x_midpoint, Ntimesteps)
 
@@ -256,23 +270,29 @@ Tᵢ, Sᵢ        = temperature_salinity_init(model.grid, parameters)
 
 report_biogeochemical_state(model)
 
-# The number of wet top-layer cells (the surface_pco2 objective's mean), from
-# the same wet mask the AD checks use; a constant of the grid, baked into the
-# compiled graph. check_surface_pCO₂_mask verifies it against the kernel's own
+# The number of wet top-layer cells (the surface objectives' mean), from the
+# same wet mask the AD checks use; a constant of the grid, baked into the
+# compiled graph. check_surface_objective verifies it against the kernel's own
 # dry test after the first evaluation.
 const n_wet_surface = count(fd_wet_masks(model).c[:, :, Nz])
-@info "Objective: $(RUN_CONFIG.objective.name)" * (OBJECTIVE isa Val{:surface_pco2} ? " (mean over $n_wet_surface wet surface cells)" : "")
+@info "Objective: $(RUN_CONFIG.objective.name)" *
+      (OBJECTIVE isa Union{Val{:surface_pco2}, Val{:co2_uptake}} ? " (mean over $n_wet_surface wet surface cells)" : "")
 
-# The surface_pco2 objective's mean must be over the cells the kernel computed:
-# its nonzero entries must be exactly the wet mask's top layer.
-check_surface_pCO₂_mask(::Val, model) = nothing
-function check_surface_pCO₂_mask(::Val{:surface_pco2}, model)
-    p = to_host(model.auxiliary_fields.pCO₂)[:, :, 1]
+# A surface objective's mean must be over the cells its kernel computed: the
+# field's nonzero entries must be exactly the wet mask's top layer.
+check_surface_objective(::Val, model) = nothing
+check_surface_objective(::Val{:surface_pco2}, model) =
+    check_surface_field(model.auxiliary_fields.pCO₂, "surface pCO₂", "μatm", model)
+check_surface_objective(::Val{:co2_uptake}, model) =
+    check_surface_field(model.auxiliary_fields.CO₂_uptake, "air→sea CO₂ flux", "mmol C m⁻² day⁻¹", model)
+
+function check_surface_field(field, what, units, model)
+    p = to_host(field)[:, :, 1]
     wet = fd_wet_masks(model).c[:, :, Nz]
     (p .!= 0) == wet ||
-        error("surface pCO₂: the kernel's wet cells ($(count(!=(0), p))) differ from the wet mask's ($(count(wet)))")
-    @info @sprintf("Surface pCO₂ at the end of the window: %.2f to %.2f μatm (mean %.4f) over %d wet cells",
-                   minimum(p[wet]), maximum(p[wet]), sum(p[wet]) / count(wet), count(wet))
+        error("$what: the kernel's wet cells ($(count(!=(0), p))) differ from the wet mask's ($(count(wet)))")
+    @info @sprintf("%s at the end of the window: %.4g to %.4g %s (mean %.6g) over %d wet cells",
+                   what, minimum(p[wet]), maximum(p[wet]), units, sum(p[wet]) / count(wet), count(wet))
     return nothing
 end
 
@@ -429,8 +449,8 @@ dedν = rdifferentiate_tracer_error(model, model_inputs, spunup_state,
 @show dedν
 
 # The model now holds the end of the window, including the objective's
-# diagnostic fields: for surface_pco2, check the mean was over the right cells.
-check_surface_pCO₂_mask(OBJECTIVE, model)
+# diagnostic fields: for a surface objective, check the mean was over the right cells.
+check_surface_objective(OBJECTIVE, model)
 
 # NaN derivatives on dry (immersed) entries — CPU Enzyme gives them in the
 # velocity shadows' wall entries — are set to 0 here, before anything saves or

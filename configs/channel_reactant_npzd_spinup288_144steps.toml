@@ -18,6 +18,7 @@ vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_tape
 fill_kappa_halos = false          # false only to reproduce runs made before the κ halo fix
 gmredi = false                    # false: no GM/Redi (then no [kappa])
 biogeochemistry = "npzd"         # "none" or "npzd" (OceanBioME NPZD; build_biogeochemistry)
+co2_gas_exchange = false          # air–sea CO₂ flux on DIC (needs biogeochemistry = "carbonate"; stage 2)
 
 [run]
 Nspinup = 288                    # 2 days
@@ -32,7 +33,7 @@ L = 250e3                        # m, Gaussian width (meridional)
 z = -800.0                       # m, centre (vertical)
 H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
 
-[objective]                      # the scalar J ("default" or "surface_pco2"; run_config.jl)
+[objective]                      # the scalar J ("default", "surface_pco2" or "co2_uptake"; run_config.jl)
 name = "default"
 
 [checks]                         # AD verification (scripts/ad_checks.jl says how to read it)

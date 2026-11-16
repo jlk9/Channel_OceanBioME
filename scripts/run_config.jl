@@ -84,11 +84,14 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     # biogeochemistry: "none", "npzd" (OceanBioME's NPZD with its defaults), or
     # "carbonate" (passive DIC and Alk tracers, no sources: the stage-1 carbonate
     # chemistry test), built by build_biogeochemistry in channel_common.jl.
+    # co2_gas_exchange: an air–sea CO₂ flux on DIC's top boundary (OceanBioME's
+    # CarbonDioxideGasExchangeBoundaryCondition; stage 2). Needs DIC and Alk, so
+    # biogeochemistry = "carbonate".
     function parse_model_config(d, w)
         keys_ = ("architecture", "Nx", "Ny", "dt", "advection", "vertical_mixing", "fill_kappa_halos", "gmredi",
-                 "biogeochemistry")
+                 "biogeochemistry", "co2_gas_exchange")
         only_config_keys(d, keys_, w)
-        return (; architecture = config_choice(d, "architecture", ("reactant", "cpu"), w),
+        model = (; architecture = config_choice(d, "architecture", ("reactant", "cpu"), w),
                   Nx = config_value(d, "Nx", Int, w; check = n -> n ≥ 2 && iseven(n), why = "must be an even integer ≥ 2"),
                   Ny = config_value(d, "Ny", Int, w; check = ≥(2), why = "must be ≥ 2"),
                   dt = config_value(d, "dt", Float64, w; check = >(0), why = "must be > 0 (seconds)"),
@@ -96,7 +99,12 @@ if !@isdefined(_RUN_CONFIG_LOADED)
                   vertical_mixing = config_choice(d, "vertical_mixing", ("catke", "scalar_surface_taper"), w),
                   fill_kappa_halos = config_value(d, "fill_kappa_halos", Bool, w),
                   gmredi = config_value(d, "gmredi", Bool, w),
-                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd", "carbonate"), w))
+                  biogeochemistry = config_choice(d, "biogeochemistry", ("none", "npzd", "carbonate"), w),
+                  co2_gas_exchange = config_value(d, "co2_gas_exchange", Bool, w))
+        model.co2_gas_exchange && model.biogeochemistry != "carbonate" &&
+            error("$w: co2_gas_exchange = true needs DIC and Alk: set biogeochemistry = \"carbonate\" " *
+                  "(it is \"$(model.biogeochemistry)\")")
+        return model
     end
 
     # [run]: step counts, and where the spinup comes from (spunup_state = ""
@@ -161,7 +169,11 @@ if !@isdefined(_RUN_CONFIG_LOADED)
     #   "surface_pco2" — the mean pCO₂ [μatm] over the wet top-layer cells at the
     #                    end of the window, from DIC, Alk, T, S through OceanBioME's
     #                    CarbonChemistry. Needs biogeochemistry = "carbonate".
-    const OBJECTIVES = ("default", "surface_pco2")
+    #   "co2_uptake"   — the mean air→sea CO₂ flux [mmol C m⁻² day⁻¹, positive
+    #                    into the ocean] over the wet top-layer cells at the end
+    #                    of the window: the flux DIC's gas-exchange boundary
+    #                    condition applies. Needs co2_gas_exchange = true.
+    const OBJECTIVES = ("default", "surface_pco2", "co2_uptake")
 
     function parse_objective_config(d, w, model)
         only_config_keys(d, ("name",), w)
@@ -169,6 +181,8 @@ if !@isdefined(_RUN_CONFIG_LOADED)
         objective.name == "surface_pco2" && model.biogeochemistry != "carbonate" &&
             error("$w: name = \"surface_pco2\" needs DIC and Alk: set [model] biogeochemistry = \"carbonate\" " *
                   "(it is \"$(model.biogeochemistry)\")")
+        objective.name == "co2_uptake" && !model.co2_gas_exchange &&
+            error("$w: name = \"co2_uptake\" is the flux of the air–sea CO₂ exchange: set [model] co2_gas_exchange = true")
         return objective
     end
 
