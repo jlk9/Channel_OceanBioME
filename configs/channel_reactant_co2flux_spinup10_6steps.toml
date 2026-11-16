@@ -48,4 +48,4 @@ directions_random = 2            # directions over all inputs at once
 # tracers appear under their names):
 directions_components = ["DIC", "Alk", "T", "S", "u", "v",
                          "u_wind_stress", "v_wind_stress", "temp_flux",
-                         "kappa_z"]
+                         "kappa_z", "co2_wind_speed", "co2_air_mole_fraction"]

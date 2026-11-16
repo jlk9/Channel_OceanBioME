@@ -468,7 +468,7 @@ function build_model(grid, Δt₀, parameters, Nx, Ny; gmredi = false, biogeoche
         # each is fully rewritten before it is read.
         auxiliary_fields = auxiliary_fields,
         boundary_conditions = co2_gas_exchange ?
-            (T = T_bcs, u = u_bcs, v = v_bcs, DIC = FieldBoundaryConditions(top = co2_exchange_boundary_condition())) :
+            (T = T_bcs, u = u_bcs, v = v_bcs, DIC = FieldBoundaryConditions(top = co2_exchange_boundary_condition(grid))) :
             (T = T_bcs, u = u_bcs, v = v_bcs),
         forcing = forcing
     )
@@ -663,26 +663,62 @@ end
 #     it is REQUIRED: the constructor's default is CarbonChemistry(), whose
 #     damped Newton solver does not compile under Reactant
 #     (docs/oceanbiome_hplus_solver_reactant.md).
-#   * [CO₂]_air: a dry-air mole fraction co2_air_mole_fraction at 1 atm,
-#     through the Weiss–Price solubility with the same chemistry's density.
+#   * [CO₂]_air: a dry-air mole fraction xCO₂ [ppmv] at 1 atm, through the
+#     Weiss–Price solubility with the same chemistry's density.
 #   * k: Ho et al. (2006) k₆₆₀ = 0.266 cm/h · u₁₀², Schmidt-number scaled
-#     (OceanBioME's defaults), at a constant u₁₀ = co2_exchange_wind_speed,
-#     about the 10-m wind of the channel's 0.2 N/m² peak westerly stress.
-# All plain numbers: baked into the compiled graph (no gradient w.r.t. them).
+#     (OceanBioME's defaults).
+# u₁₀ and xCO₂ are CONTROLS: 2-D surface Fields in the boundary condition,
+# copied from ModelInputs (co2_wind_speed, co2_air_mole_fraction) at the start
+# of every run (set_forcing_and_bcs!), so they have gradients and the checks
+# perturb them. Their initial values are uniform: u₁₀ = co2_exchange_wind_speed
+# (about the 10-m wind of the channel's 0.2 N/m² peak westerly stress) and
+# xCO₂ = co2_air_mole_fraction. The rest (k₆₆₀ coefficient, Schmidt-number and
+# solubility fits) are plain numbers: baked into the compiled graph.
 # Dry (wall) columns: the flux is evaluated on their zero tracers (finite, with
 # finite Enzyme derivatives, tested on CPU 2026-11-15) and acts on cells that
 # are not wet; the objective excludes them.
-const co2_exchange_wind_speed = 10.0   # u₁₀ [m/s]
-const co2_air_mole_fraction   = 413.0  # xCO₂ [ppmv]
+const co2_exchange_wind_speed = 10.0   # initial u₁₀ [m/s]
+const co2_air_mole_fraction   = 413.0  # initial xCO₂ [ppmv]
 
-co2_exchange_boundary_condition() =
+# A 2-D (Center, Center, Nothing) Field as an OceanBioME surface value. OceanBioME
+# reads a Field at [i, j, grid.Nz] (surface_values.jl), which on the host
+# Oceananigans maps onto a 2-D Field's single level, but inside a kernel the
+# Field is a bare array with one level, so k = Nz would read past it. This
+# reads level 1. (Adapt is not a direct dependency: OceanBioME's binding of it.)
+const Adapt = OceanBioME.Models.GasExchangeModel.Adapt
+struct SurfaceField{F}
+    field :: F
+end
+Adapt.adapt_structure(to, s::SurfaceField) = SurfaceField(Adapt.adapt(to, s.field))
+@inline OceanBioME.Models.GasExchangeModel.surface_value(s::SurfaceField, i, j, grid, clock, args...) =
+    @inbounds s.field[i, j, 1]
+
+# The boundary condition, with its own (zeroed) u₁₀ and xCO₂ Fields on `grid`:
+# set_forcing_and_bcs! fills them from ModelInputs before every run.
+co2_exchange_boundary_condition(grid) =
     OceanBioME.CarbonDioxideGasExchangeBoundaryCondition(; carbon_chemistry,
-                                                          wind_speed = co2_exchange_wind_speed,
-                                                          air_concentration = co2_air_mole_fraction)
+                                                          wind_speed = SurfaceField(Field{Center, Center, Nothing}(grid)),
+                                                          air_concentration = SurfaceField(Field{Center, Center, Nothing}(grid)))
+
+# The u₁₀ and xCO₂ Fields inside DIC's gas-exchange boundary condition.
+function co2_exchange_bc_fields(model)
+    g = model.tracers.DIC.boundary_conditions.top.condition.func   # OceanBioME's GasExchange
+    return (; wind_speed = g.wind_speed.field, air_mole_fraction = g.air_concentration.mole_fraction.field)
+end
+
+# The ModelInputs entries (uniform initial values on `grid`), or `nothing`
+# without gas exchange.
+function co2_exchange_input(value, grid)
+    co2_gas_exchange || return nothing
+    f = Field{Center, Center, Nothing}(grid)
+    set!(f, value)
+    return f
+end
 
 co2_gas_exchange_details() = co2_gas_exchange ?
     "OceanBioME.CarbonDioxideGasExchangeBoundaryCondition on DIC (top): carbon_chemistry as above, " *
-    "u10 = $co2_exchange_wind_speed m/s, xCO2 = $co2_air_mole_fraction ppmv, other defaults (Ho06, Schmidt scaling, Weiss-Price)" : ""
+    "u10 and xCO2 surface Fields (ModelInputs controls) initially $co2_exchange_wind_speed m/s and " *
+    "$co2_air_mole_fraction ppmv, other defaults (Ho06, Schmidt scaling, Weiss-Price)" : ""
 
 # The air→sea CO₂ flux [mmol C m⁻² day⁻¹, positive INTO the ocean] in each
 # surface column of `model`'s current state, into the 2-D Field `uptake`
@@ -871,12 +907,30 @@ spice_on(p) = p.ΔS_spice != 0
 #   dmodel_inputs = Enzyme.make_zero(model_inputs)
 # Gradients accumulate into the leaf arrays in place, so immutability is no
 # obstacle.
-struct ModelInputs{US, VS, TF, DZ}
-    u_wind_stress :: US
-    v_wind_stress :: VS
-    temp_flux     :: TF
-    Δz            :: DZ
+#
+# The air–sea CO₂ exchange's controls (co2_wind_speed, co2_air_mole_fraction:
+# u₁₀ [m/s] and xCO₂ [ppmv], 2-D surface Fields) are `nothing` without
+# [model] co2_gas_exchange; forcing_field_names lists the Fields present.
+struct ModelInputs{US, VS, TF, CW, CX, DZ}
+    u_wind_stress         :: US
+    v_wind_stress         :: VS
+    temp_flux             :: TF
+    co2_wind_speed        :: CW
+    co2_air_mole_fraction :: CX
+    Δz                    :: DZ
 end
+
+# The ModelInputs entries that are surface Fields (every one but Δz and the
+# absent ones), in order: what the checks perturb and the saves record.
+forcing_field_names(inputs::ModelInputs) =
+    filter(k -> getfield(inputs, k) !== nothing,
+           (:u_wind_stress, :v_wind_stress, :temp_flux, :co2_wind_speed, :co2_air_mole_fraction))
+
+# The CO₂-exchange inputs (or their shadows) as save-file entries, `prefix`ed
+# ("d" for the sensitivities); none without gas exchange.
+co2_exchange_entries(inputs; prefix = "") =
+    co2_gas_exchange ? (; Symbol(prefix, "co2_wind_speed") => to_host(inputs.co2_wind_speed),
+                          Symbol(prefix, "co2_air_mole_fraction") => to_host(inputs.co2_air_mole_fraction)) : (;)
 
 # The prognostic state of a HydrostaticFreeSurfaceModel with a SplitExplicit
 # free surface. Held as PLAIN DEVICE ARRAYS (ConcreteRArray), sized to each
@@ -1258,6 +1312,11 @@ function set_forcing_and_bcs!(model, inputs)
     set!(model.velocities.u.boundary_conditions.top.condition, inputs.u_wind_stress)
     set!(model.velocities.v.boundary_conditions.top.condition, inputs.v_wind_stress)
     set!(model.tracers.T.boundary_conditions.top.condition, inputs.temp_flux)
+    if co2_gas_exchange
+        bc = co2_exchange_bc_fields(model)
+        set!(bc.wind_speed, inputs.co2_wind_speed)
+        set!(bc.air_mole_fraction, inputs.co2_air_mole_fraction)
+    end
     return nothing
 end
 

@@ -297,7 +297,12 @@ function check_surface_field(field, what, units, model)
 end
 
 # Fixed experiment configuration (never mutated after this point):
-model_inputs  = ModelInputs(u_wind_stress, v_wind_stress, T_flux, Δzᶜ)
+# The air–sea CO₂ exchange's controls (nothing without co2_gas_exchange):
+# uniform u₁₀ and xCO₂ surface Fields, copied into the boundary condition at
+# the start of every run.
+model_inputs  = ModelInputs(u_wind_stress, v_wind_stress, T_flux,
+                            co2_exchange_input(co2_exchange_wind_speed, model.grid),
+                            co2_exchange_input(co2_air_mole_fraction, model.grid), Δzᶜ)
 
 # Two prognostic snapshots, allocated now because @compile bakes in argument
 # shapes and types: the analytic pre-spinup IC, and the post-spinup state that
@@ -422,7 +427,8 @@ write_run_config(RUN_CONFIG)
 # state = spunup_state: the window's full starting state goes into
 # data_init.jld2, so a later run can start from this file (spunup_state_path).
 save_init!(filename, model, dmodel, u_wind_stress, v_wind_stress, T_flux;
-           extra = use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata,
+           extra = merge(use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata,
+                         co2_exchange_entries(model_inputs)),
            state = spunup_state)
 
 # The objective at the current inputs, from the compiled forward function, and
@@ -470,6 +476,7 @@ J_probe === nothing ||
 filename = graph_directory * "data_final.jld2"
 save_final!(filename, model, dmodel, dmodel_inputs, dspunup_state, dedν;
             extra = merge(use_gmredi ? merge(run_metadata, gmredi_save_fields(model, dmodel)) : run_metadata,
+                          co2_exchange_entries(dmodel_inputs; prefix = "d"),
                           (; dry_nans_zeroed = dry_nan_report)))
 
 # One forward-mode call at the current inputs with FRESH tangent shadows (the

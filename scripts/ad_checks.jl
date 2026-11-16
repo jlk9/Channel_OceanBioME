@@ -52,7 +52,8 @@
 #     CATKE's e, biogeochemical tracers), u, v, ssh (η), U, V. Not w (diagnosed
 #     from continuity at the restore, so its gradient is zero), the closure state
 #     or the clock time;
-#   * the forcing (ModelInputs): u_wind_stress, v_wind_stress, temp_flux;
+#   * the forcing (ModelInputs): u_wind_stress, v_wind_stress, temp_flux, and
+#     with the air–sea CO₂ exchange co2_wind_speed and co2_air_mole_fraction;
 #   * fields inside the model: kappa_skew and kappa_symmetric (with GM/Redi), and
 #     kappa_z, the background vertical diffusivity field (shared by all tracers).
 # Plain numbers inside the model (κh, νh, a biogeochemistry's parameters stored
@@ -225,7 +226,7 @@ if !@isdefined(_AD_CHECKS_LOADED)
         end
 
         # Field shadows: the forcing, κz (one Field shared by every tracer), GM/Redi κ.
-        fields = Tuple{String, Any}[(String(k), getfield(dinputs, k)) for k in (:u_wind_stress, :v_wind_stress, :temp_flux)]
+        fields = Tuple{String, Any}[(String(k), getfield(dinputs, k)) for k in forcing_field_names(dinputs)]
         vsc = vertical_scalar_closure(dmodel)
         vsc !== nothing && vsc.κ.T isa Field && push!(fields, ("kappa_z", vsc.κ.T))
         dissd = find_closure(dmodel, IsopycnalSkewSymmetricDiffusivity)
@@ -293,7 +294,7 @@ if !@isdefined(_AD_CHECKS_LOADED)
                                  ("V",   state.V, dstate.V, fs.barotropic_velocities.V))
             push!(comps, state_component(name, a, da, fd_mask(masks, f)))
         end
-        for k in (:u_wind_stress, :v_wind_stress, :temp_flux)
+        for k in forcing_field_names(inputs)
             f = getfield(inputs, k)
             push!(comps, field_component(String(k), f, getfield(dinputs, k), fd_mask(masks, f)))
         end
