@@ -1,0 +1,53 @@
+# Run config: run with
+#   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
+#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_gmredi_spinup10_6steps.toml
+# Output: runs/channel_gmredi_spinup10_6steps/. Every key is required;
+# see scripts/run_config.jl for the rules. Values are SI.
+#
+# Stage 0 of the OceanBioME roadmap: the physics-only channel (no
+# biogeochemistry), scalar vertical mixing, no GM/Redi, spice off, default J.
+# Spun up for a month (4320 steps of 600 s); then a 1-day (144-step) window,
+# its AD gradient (Binomial-checkpointed), the determinism probe, the
+# forward-mode check and the FD check (ad_checks.jl). Over a day FD is harder
+# than over an hour (round-off-limited small derivatives; with upwind BGC
+# advection, kinks): read the forward-mode check first.
+
+[model]
+architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
+Nx = 40
+Ny = 80
+dt = 600.0                       # s
+advection = "centered"           # "centered" (smooth; needed for the FD check) or "weno"
+vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
+fill_kappa_halos = true           # false only to reproduce runs made before the κ halo fix
+gmredi = false                    # false: no GM/Redi (then no [kappa])
+biogeochemistry = "none"         # "none", "npzd", "lobster" or "carbonate" (build_biogeochemistry)
+co2_gas_exchange = false          # air–sea CO₂ flux on DIC (needs biogeochemistry = "carbonate"; stage 2)
+
+[run]
+Nspinup = 4320                   # 1 month (30 days)
+Ntimesteps = 144                 # 1 day: the estimate window (the AD'd part)
+spunup_state = ""                # "" = spin up here; else a saved data_init/data_final.jld2
+
+[spice]                          # density-compensated salinity anomaly (spice_anomaly)
+S0 = 35.0                        # psu, reference salinity
+dS = 0.0                         # psu, amplitude; 0 = off
+y = 800e3                        # m, centre (meridional)
+L = 250e3                        # m, Gaussian width (meridional)
+z = -800.0                       # m, centre (vertical)
+H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
+
+[objective]                      # the scalar J (run_config.jl lists the choices)
+name = "default"
+
+[checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
+determinism_probe = true         # J bitwise reproducible after an AD call at other inputs (~1 AD + 2 forward calls)
+forward_check = true             # forward-mode (JVP) vs reverse-mode directional derivatives (1 forward-mode window per direction)
+fd_check = true                  # FD vs AD directional derivatives (2 forward windows per ε per direction)
+directions_seed = 2026           # seeds every direction (forward-mode and FD checks)
+directions_random = 2            # directions over all inputs at once
+# One direction per input listed (the log lists the model's inputs; biogeochemical
+# tracers appear under their names):
+directions_components = ["T", "S", "u", "v",
+                         "u_wind_stress", "v_wind_stress", "temp_flux",
+                         "kappa_z"]

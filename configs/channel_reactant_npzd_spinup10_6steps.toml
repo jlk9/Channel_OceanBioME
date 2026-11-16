@@ -1,12 +1,15 @@
 # Run config: run with
 #   export XLA_FLAGS="--xla_backend_extra_options=xla_cpu_use_multi_output_fusion"
-#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_gmredi_spinup10_6steps.toml
-# Output: runs/channel_gmredi_spinup10_6steps/. Every key is required;
+#   julia -O0 --project scripts/abernathey_channel.jl configs/channel_reactant_npzd_spinup10_6steps.toml
+# Output: runs/channel_reactant_npzd_spinup10_6steps/. Every key is required;
 # see scripts/run_config.jl for the rules. Values are SI.
 #
-# The channel with constant-κ GM/Redi and scalar vertical mixing, spice
-# off, spun up for a month; then a 1-day window, its AD gradient, the
-# determinism probe, the forward-mode check and the FD check of every input (ad_checks.jl).
+# Stage 3 of the OceanBioME roadmap: the channel with OceanBioME's NPZD
+# (defaults; first-order upwind BGC advection) and scalar vertical mixing (no
+# GM/Redi), spice off, spun up for 10 steps (100 min); then a 6-step (1-hour)
+# window with the default J, its AD gradient, the determinism probe, the
+# forward-mode check and the FD check of every input (ad_checks.jl).
+# fill_kappa_halos only acts with GM/Redi, so its value here is immaterial.
 
 [model]
 architecture = "reactant"        # "reactant" (compiled; checkpointed window) or "cpu" (plain Julia + Enzyme)
@@ -17,12 +20,12 @@ advection = "centered"           # "centered" (smooth; needed for the FD check) 
 vertical_mixing = "scalar_surface_taper"       # "catke" or "scalar_surface_taper"
 fill_kappa_halos = false          # false only to reproduce runs made before the κ halo fix
 gmredi = false                    # false: no GM/Redi (then no [kappa])
-biogeochemistry = "npzd"         # "none" or "npzd" (OceanBioME NPZD; build_biogeochemistry)
+biogeochemistry = "npzd"         # "none", "npzd", "lobster" or "carbonate" (build_biogeochemistry)
 co2_gas_exchange = false          # air–sea CO₂ flux on DIC (needs biogeochemistry = "carbonate"; stage 2)
 
 [run]
-Nspinup = 10                   # 1 month
-Ntimesteps = 6                 # 1 day: the estimate window (the AD'd part)
+Nspinup = 10                     # 10 steps (100 min)
+Ntimesteps = 6                   # 6 steps (1 hour): the estimate window (the AD'd part)
 spunup_state = ""                # "" = spin up here; else a saved data_init/data_final.jld2
 
 [spice]                          # density-compensated salinity anomaly (spice_anomaly)
@@ -33,7 +36,7 @@ L = 250e3                        # m, Gaussian width (meridional)
 z = -800.0                       # m, centre (vertical)
 H = 300.0                        # m, Gaussian width (vertical); inf = depth-independent
 
-[objective]                      # the scalar J ("default", "surface_pco2" or "co2_uptake"; run_config.jl)
+[objective]                      # the scalar J (run_config.jl lists the choices)
 name = "default"
 
 [checks]                         # AD verification (scripts/ad_checks.jl says how to read it)
